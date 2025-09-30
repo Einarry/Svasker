@@ -1,26 +1,85 @@
+# app.py
+# Streamlit app for improving medical-scientific text and producing DOCX outputs.
+# - Clean improved DOCX
+# - Track Changes DOCX (via Python-Redlines, if available)
+#
+# NOTE: Make sure your requirements include:
+#   streamlit
+#   python-docx
+#   openai
+#   python_redlines @ git+https://github.com/JSv4/Python-Redlines@v0.0.5
+#
+# And add your API key in Streamlit Cloud (App → ⋮ → Settings → Secrets):
+#   OPENAI_API_KEY = sk-...
+
+from __future__ import annotations
+
 import io
-import tempfile
+import pathlib
 import textwrap
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
 import streamlit as st
 from docx import Document
 from openai import OpenAI
 
-# NEW: Python-Redlines
-from python_redlines.engines import XmlPowerToolsEngine
+# Optional Track Changes engine (Python-Redlines). We import lazily inside a function
+# so the app still runs even if the package or runtime is missing.
 
-st.set_page_config(page_title="MedLang Improver (Track Changes)", page_icon="🩺", layout="centered")
 
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", None)
-if not OPENAI_API_KEY:
-    st.warning("Mangler OPENAI_API_KEY i Secrets (App → ⋮ → Settings → Secrets).")
-client = OpenAI(api_key=OPENAI_API_KEY)
+# -----------------------------
+# Build timestamp (Europe/Oslo)
+# -----------------------------
+def _build_time_oslo() -> str:
+    try:
+        ts = pathlib.Path(__file__).stat().st_mtime
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(ZoneInfo("Europe/Oslo"))
+    except Exception:
+        dt = datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/Oslo"))
+    return dt.strftime("%Y-%m-%d %H:%M (%Z)")
+
+
+BUILD_TIME_LOCAL = _build_time_oslo()
+
+
+# -----------------------------
+# Streamlit page config & badge
+# -----------------------------
+st.set_page_config(page_title="MedLang Improver — Track Changes", page_icon="🩺", layout="centered")
+
+# Build badge in top-left
+st.markdown(
+    f"""
+    <div style="
+        position: fixed; top: 8px; left: 12px;
+        padding: 4px 10px; border-radius: 8px;
+        font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        background: rgba(0,0,0,0.06); backdrop-filter: blur(2px);
+        z-index: 1000;">
+        Build: {BUILD_TIME_LOCAL}
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.title("🩺 Språkforbedrer for medisinske artikler — med Track Changes")
-st.markdown("Last opp Word eller lim inn tekst. Få både **ren** forbedret fil og en **.docx med Spor endringer**.")
+st.markdown("Last opp Word eller lim inn tekst. Få både **ren** forbedret fil og en **.docx med Spor endringer** (når tilgjengelig).")
 
+# -----------------------------
+# OpenAI client
+# -----------------------------
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", None)
+if not OPENAI_API_KEY:
+    st.warning("Mangler OPENAI_API_KEY i Secrets (App → ⋮ → Settings → Secrets). Appen vil ikke kunne forbedre tekst.")
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# -----------------------------
+# UI: input
+# -----------------------------
 tab1, tab2 = st.tabs(["📄 Word-fil (.docx)", "✍️ Lim inn tekst"])
-uploaded_text = None
-source_docx_bytes = None
+uploaded_text: str | None = None
+source_docx_bytes: bytes | None = None
 
 with tab1:
     up = st.file_uploader("Last opp .docx", type=["docx"])
@@ -33,18 +92,29 @@ with tab1:
             st.error(f"Kunne ikke lese Word-filen: {e}")
 
 with tab2:
-    pasted = st.text_area("Lim inn tekst her", height=300, placeholder="Lim inn manus...")
+    pasted = st.text_area("Lim inn tekst her", height=300, placeholder="Lim inn manus her …")
     if pasted and not uploaded_text:
         uploaded_text = pasted
 
 colA, colB = st.columns(2)
 with colA:
-    tone = st.selectbox("Tone/retning", ["Nøytral faglig", "Mer konsis", "Mer formell", "For legfaglig publikum"])
+    tone = st.selectbox(
+        "Tone/retning",
+        ["Nøytral faglig", "Mer konsis", "Mer formell", "For legfaglig publikum"],
+        help="Velg hvordan teksten skal forbedres."
+    )
 with colB:
-    model = st.selectbox("Modell", ["gpt-4o-mini", "gpt-4o"], help="Mini er rimelig og rask. gpt-4o gir litt høyere kvalitet.")
+    model_name = st.selectbox(
+        "Modell",
+        ["gpt-4o-mini", "gpt-4o"],
+        help="Mini er rimelig og rask; gpt-4o kan gi litt høyere kvalitet."
+    )
 
-st.caption("Tips: Del store manus i seksjoner for bedre kontroll. Track Changes genereres ved å sammenligne original og forbedret versjon.")
+st.caption("Tips: Del store manus i seksjoner (Introduksjon, Metode, Resultater, osv.) for bedre kontroll.")
 
+# -----------------------------
+# Prompts
+# -----------------------------
 GOALS = {
     "Nøytral faglig": (
         "Forbedre klarhet, flyt og grammatikk i vitenskapelig medisinsk tekst. "
@@ -71,8 +141,13 @@ SYSTEM_PROMPT = (
     "Ikke endre referanseformatering."
 )
 
+
+# -----------------------------
+# Helpers
+# -----------------------------
 def improve_text(text: str, mode: str, model_name: str) -> str:
     instr = GOALS.get(mode, GOALS["Nøytral faglig"])
+    # Chat Completions (OpenAI SDK v1)
     resp = client.chat.completions.create(
         model=model_name,
         messages=[
@@ -82,6 +157,7 @@ def improve_text(text: str, mode: str, model_name: str) -> str:
         temperature=0.2,
     )
     return resp.choices[0].message.content.strip()
+
 
 def make_docx_from_text(text: str, heading: str | None = None) -> bytes:
     d = Document()
@@ -93,76 +169,27 @@ def make_docx_from_text(text: str, heading: str | None = None) -> bytes:
     d.save(bio)
     return bio.getvalue()
 
+
 def build_redline_docx(original_docx: bytes, improved_docx: bytes, author_tag: str = "ChatGPT") -> bytes:
     """
-    Bruk Python-Redlines (Open-XML-PowerTools under panseret) til å lage en .docx med track changes.
+    Generate a real Track Changes DOCX by comparing original vs improved.
+    Uses Python-Redlines (Open-XML-PowerTools under the hood).
+    Returns bytes for the redlined DOCX or raises on failure.
     """
-    engine = XmlPowerToolsEngine()  # bruker medfølgende binær
-    # run_redline kan ta bytes eller filstier og returnerer bytes for redline.docx
+    # Lazy import so the app can run without the dependency.
+    from python_redlines.engines import XmlPowerToolsEngine  # type: ignore
+
+    engine = XmlPowerToolsEngine()
+    # The wrapper accepts bytes or file paths; return value is bytes for the redline docx.
     redlined_bytes = engine.run_redline(
         author_tag=author_tag,
         original_docx_bytes=original_docx,
-        modified_docx_bytes=improved_docx
+        modified_docx_bytes=improved_docx,
     )
     return redlined_bytes
 
-run = st.button("⚙️ Forbedre språk og lag Spor endringer", type="primary", disabled=(not uploaded_text or not OPENAI_API_KEY))
 
-if run:
-    with st.spinner("Forbedrer tekst..."):
-        try:
-            improved = improve_text(uploaded_text, tone, model)
-        except Exception as e:
-            st.error(f"Feil fra modellen: {e}")
-            st.stop()
-
-    # Lag 'ren' forbedret DOCX
-    improved_docx = make_docx_from_text(improved, "Forbedret tekst")
-
-    # Lag original DOCX (hvis bruker limte inn tekst i stedet for å laste opp fil)
-    if source_docx_bytes is None:
-        source_docx_bytes = make_docx_from_text(uploaded_text, "Originaltekst")
-
-    # Forsøk å lage Track Changes (.docx)
-    redline_bytes = None
-    redline_error = None
-    with st.spinner("Genererer Word med Spor endringer..."):
-        try:
-            redline_bytes = build_redline_docx(source_docx_bytes, improved_docx, author_tag="ChatGPT")
-        except Exception as e:
-            redline_error = str(e)
-
-    st.success("Ferdig!")
-
-    st.subheader("Forhåndsvisning (ren forbedret tekst)")
-    st.text_area("Forbedret tekst", improved, height=300)
-
-    st.download_button(
-        "💾 Last ned ren forbedret Word (.docx)",
-        data=improved_docx,
-        file_name="forbedret_ren.docx",
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    )
-
-    if redline_bytes:
-        st.download_button(
-            "📝 Last ned med Spor endringer (.docx)",
-            data=redline_bytes,
-            file_name="forbedret_spor_endringer.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
-        st.caption("Dette dokumentet inneholder ekte Track Changes du kan godta/avslå i Word.")
-    else:
-        st.warning(
-            "Klarte ikke å generere Word med Spor endringer denne gangen. "
-            "Du kan likevel bruke den rene forbedrede filen. "
-            "Hvis problemet vedvarer i skyen, kan vi aktivere en fallback som legger inn kommentarer i stedet."
-        )
-
-st.markdown("---")
-st.markdown(
-    textwrap.dedent("""
-    **Hvorfor dette virker:** Vi sammenligner original og forbedret tekst for å lage en tredje fil med Track Changes
-    (w:ins/w:del). Word viser disse som endringsforslag du kan godta/avslå.
-    """)
-)
+# -----------------------------
+# Action
+# -----------------------------
+run_btn =_
