@@ -32,6 +32,8 @@ BUILD_TIME_LOCAL = _build_time_oslo()
 # Streamlit page config & badge
 # -----------------------------
 st.set_page_config(page_title="MedLang Improver", page_icon="🩺", layout="centered")
+
+# Liten badge øverst til venstre
 st.markdown(
     f"""
     <div style="
@@ -47,7 +49,10 @@ st.markdown(
 )
 
 st.title("🩺 Språkforbedrer for medisinske artikler")
-st.markdown("Last opp Word eller lim inn tekst. Få **ren forbedret** fil og en **visuell sammenligning** (understrek = innsatt, gjennomstreking = slettet).")
+st.markdown(
+    "Last opp Word eller lim inn tekst. Få **ren forbedret** fil og en "
+    "**visuell sammenligning** (understrek = innsatt, gjennomstreking = slettet)."
+)
 
 # -----------------------------
 # OpenAI client
@@ -55,7 +60,7 @@ st.markdown("Last opp Word eller lim inn tekst. Få **ren forbedret** fil og en 
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", None)
 if not OPENAI_API_KEY:
     st.warning("Mangler OPENAI_API_KEY i Secrets (App → ⋮ → Settings → Secrets). Appen kan ikke forbedre tekst.")
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # -----------------------------
 # UI: input
@@ -84,13 +89,13 @@ with colA:
     tone = st.selectbox(
         "Tone/retning",
         ["Nøytral faglig", "Mer konsis", "Mer formell", "For legfaglig publikum"],
-        help="Velg hvordan teksten skal forbedres."
+        help="Velg hvordan teksten skal forbedres.",
     )
 with colB:
     model_name = st.selectbox(
         "Modell",
         ["gpt-4o-mini", "gpt-4o"],
-        help="Mini er rimelig og rask; gpt-4o kan gi litt høyere kvalitet."
+        help="Mini er rimelig og rask; gpt-4o kan gi litt høyere kvalitet.",
     )
 
 st.caption("Tips: Del store manus i seksjoner (Introduksjon, Metode, Resultater, osv.) for bedre kontroll.")
@@ -129,11 +134,13 @@ SYSTEM_PROMPT = (
 # -----------------------------
 def improve_text(text: str, mode: str, model_name: str) -> str:
     instr = GOALS.get(mode, GOALS["Nøytral faglig"])
+    if not client:
+        raise RuntimeError("OPENAI_API_KEY mangler – kan ikke kalle modellen.")
     resp = client.chat.completions.create(
         model=model_name,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"{instr}\n\nTekst:\n{text}"}
+            {"role": "user", "content": f"{instr}\n\nTekst:\n{text}"},
         ],
         temperature=0.2,
     )
@@ -149,8 +156,7 @@ def make_docx_from_text(text: str, heading: str | None = None) -> bytes:
     d.save(bio)
     return bio.getvalue()
 
-# --- Visual diff (no external deps) ---
-# Tokeniserer på ord + mellomrom, bevarer whitespace.
+# --- Visuell diff (ingen eksterne avhengigheter) ---
 TOKEN_RE = re.compile(r"\s+|\w+|[^\w\s]", re.UNICODE)
 
 def tokenize_keep_ws(s: str) -> List[str]:
@@ -164,16 +170,15 @@ def diff_tokens(a: List[str], b: List[str]) -> List[Tuple[str, str]]:
     sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
     out: List[Tuple[str, str]] = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == 'equal':
-            out.append(('=', ''.join(a[i1:i2])))
-        elif tag == 'insert':
-            out.append(('+', ''.join(b[j1:j2])))
-        elif tag == 'delete':
-            out.append(('-', ''.join(a[i1:i2])))
-        elif tag == 'replace':
-            # representer som delete + insert
-            out.append(('-', ''.join(a[i1:i2])))
-            out.append(('+', ''.join(b[j1:j2])))
+        if tag == "equal":
+            out.append(("=", "".join(a[i1:i2])))
+        elif tag == "insert":
+            out.append(("+", "".join(b[j1:j2])))
+        elif tag == "delete":
+            out.append(("-", "".join(a[i1:i2])))
+        elif tag == "replace":
+            out.append(("-", "".join(a[i1:i2])))
+            out.append(("+", "".join(b[j1:j2])))
     return out
 
 def make_visual_diff_docx(original_text: str, improved_text: str) -> bytes:
@@ -187,9 +192,9 @@ def make_visual_diff_docx(original_text: str, improved_text: str) -> bytes:
     doc = Document()
     doc.add_heading("Visuell sammenligning (ikke ekte Spor endringer)", level=1)
 
-    # Sammenlign linje for linje for å holde avsnitt strukturert
-    orig_lines = original_text.split("\n")
-    imp_lines = improved_text.split("\n")
+    orig_lines = original_text.split("\n") if original_text is not None else [""]
+    imp_lines = improved_text.split("\n") if improved_text is not None else [""]
+
     max_len = max(len(orig_lines), len(imp_lines))
 
     for idx in range(max_len):
@@ -206,15 +211,11 @@ def make_visual_diff_docx(original_text: str, improved_text: str) -> bytes:
 
         for op, segment in edits:
             run: Run = p.add_run(segment)
-            if op == '+':
+            if op == "+":
                 run.font.underline = True
-            elif op == '-':
+            elif op == "-":
                 run.font.strike = True
-                # Gjør slettede deler litt lysegrå for synlighet
-                run.font.color.rgb = None  # beholder standard; kan evt. justeres
-            else:
-                # lik tekst
-                pass
+            # '=' → uendret
 
     bio = io.BytesIO()
     doc.save(bio)
@@ -230,6 +231,14 @@ run_btn = st.button(
 )
 
 if run_btn:
+    # Ekstra guard: skulle ikke skje pga disabled, men tryggere.
+    if not uploaded_text:
+        st.error("Ingen tekst funnet.")
+        st.stop()
+    if not OPENAI_API_KEY:
+        st.error("OPENAI_API_KEY mangler.")
+        st.stop()
+
     with st.spinner("Forbedrer tekst …"):
         try:
             improved = improve_text(uploaded_text, tone, model_name)
@@ -240,16 +249,20 @@ if run_btn:
     # Ren forbedret DOCX
     improved_docx = make_docx_from_text(improved, "Forbedret tekst")
 
-    # Sikre original DOCX bytes for eventuell manuell sammenligning
+    # Original DOCX (for innlimt tekst)
     if source_docx_bytes is None:
         source_docx_bytes = make_docx_from_text(uploaded_text, "Originaltekst")
 
-    # Visuell diff DOCX (lokal, ingen eksterne avhengigheter)
+    # Visuell diff DOCX
     with st.spinner("Lager visuell sammenligning …"):
-        visual_diff_bytes = make_visual_diff_docx(
-            original_text=uploaded_text,
-            improved_text=improved
-        )
+        try:
+            visual_diff_bytes = make_visual_diff_docx(
+                original_text=uploaded_text,
+                improved_text=improved,
+            )
+        except Exception as e:
+            st.error(f"Kunne ikke lage visuell sammenligning: {e}")
+            visual_diff_bytes = None
 
     st.success("Ferdig!")
 
@@ -263,17 +276,18 @@ if run_btn:
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
 
-    st.download_button(
-        "📝 Last ned visuell sammenligning (.docx)",
-        data=visual_diff_bytes,
-        file_name="sammenligning_visuell.docx",
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    )
+    if visual_diff_bytes:
+        st.download_button(
+            "📝 Last ned visuell sammenligning (.docx)",
+            data=visual_diff_bytes,
+            file_name="sammenligning_visuell.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
 
 st.markdown("---")
 st.markdown(
     textwrap.dedent("""
-    **Merk:** Dette dokumentet med visuell sammenligning bruker understrek (innsatt) og gjennomstreking (slettet).
+    **Merk:** Dokumentet med visuell sammenligning bruker understrek (innsatt) og gjennomstreking (slettet).
     Det er ikke ekte *Spor endringer*. Hvis du trenger ekte Track Changes automatisk, kan vi koble til en
     ekstern dokumenttjeneste (f.eks. Aspose/GroupDocs Cloud) via API-nøkler, eller du kan i Word bruke
     **Se gjennom → Sammenlign** mellom original og forbedret.
