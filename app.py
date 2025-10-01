@@ -6,7 +6,6 @@ import pathlib
 import re
 import textwrap
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 from typing import List, Tuple
 from zipfile import ZipFile
 
@@ -15,26 +14,26 @@ from docx import Document
 from docx.text.run import Run
 from openai import OpenAI
 import difflib
-from lxml import etree as ET  # lxml kommer via python-docx-avhengighet
+from lxml import etree as ET  # lxml følger med via python-docx
 
 # -----------------------------
-# Build timestamp (Europe/Oslo)
+# Build timestamp (UTC)
 # -----------------------------
-def _build_time_oslo() -> str:
+def _build_time_utc() -> str:
     try:
         ts = pathlib.Path(__file__).stat().st_mtime
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(ZoneInfo("Europe/Oslo"))
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
-        dt = datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/Oslo"))
-    return dt.strftime("%Y-%m-%d %H:%M (%Z)")
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-BUILD_TIME_LOCAL = _build_time_oslo()
+BUILD_TIME_UTC = _build_time_utc()
 
 # -----------------------------
 # Streamlit page config & badge
 # -----------------------------
 st.set_page_config(page_title="MedLang Improver — ekte Track Changes", page_icon="🩺", layout="centered")
 
+# Liten badge øverst til venstre (UTC)
 st.markdown(
     f"""
     <div style="
@@ -43,7 +42,7 @@ st.markdown(
         font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
         background: rgba(0,0,0,0.06); backdrop-filter: blur(2px);
         z-index: 1000;">
-        Build: {BUILD_TIME_LOCAL}
+        Build: {BUILD_TIME_UTC}
     </div>
     """,
     unsafe_allow_html=True,
@@ -213,7 +212,6 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
 
     root = ET.fromstring(orig_doc_xml)
     nsmap = root.nsmap.copy()
-    # Sikre at 'w' finnes
     W_NS = nsmap.get("w", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
     XML_NS = "http://www.w3.org/XML/1998/namespace"
 
@@ -225,14 +223,12 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
     new_root = ET.Element(f"{{{W_NS}}}document", nsmap=nsmap)
     new_body = ET.SubElement(new_root, f"{{{W_NS}}}body")
 
-    # Forutsigbar id + tidsstempel
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     rev_id = 1
 
     def _add_text_run(parent, text: str):
         r = ET.SubElement(parent, f"{{{W_NS}}}r")
         t = ET.SubElement(r, f"{{{W_NS}}}t")
-        # Bevar ledende/etterfølgende blank
         if text.startswith(" ") or text.endswith(" "):
             t.set(f"{{{XML_NS}}}space", "preserve")
         t.text = text
@@ -240,11 +236,10 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
     def _add_del_run(parent, text: str):
         r = ET.SubElement(parent, f"{{{W_NS}}}r")
         dt = ET.SubElement(r, f"{{{W_NS}}}delText")
-        if text.startswith(" ") or text.endswith(" "):
+        if text.startswith(" ") or text.endswith(" ""):
             dt.set(f"{{{XML_NS}}}space", "preserve")
         dt.text = text
 
-    # Del i avsnitt (linjeskift)
     orig_lines = (original_text or "").split("\n")
     imp_lines = (improved_text or "").split("\n")
     max_len = max(len(orig_lines), len(imp_lines))
@@ -289,7 +284,7 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
                 rev_id += 1
                 _add_del_run(de, seg)
 
-    # Legg til seksjonsegenskaper (krav i Word at body slutter med sectPr)
+    # Legg til seksjonsegenskaper til slutt (Word krever at body slutter med sectPr)
     new_body.append(sectPr_clone)
 
     new_xml = ET.tostring(new_root, xml_declaration=True, encoding="UTF-8", standalone="yes")
@@ -332,16 +327,12 @@ if run_btn:
     # Ren forbedret DOCX
     improved_docx = make_docx_from_text(improved, "Forbedret tekst")
 
-    # Original DOCX (om bruker limte inn tekst)
-    if source_docx_bytes is None:
-        source_docx_bytes = make_docx_from_text(uploaded_text, "Originaltekst")
-
-    # Ekte Track Changes DOCX
+    # Ekte Track Changes DOCX (fra ren tekstdiff)
     with st.spinner("Genererer ekte Track Changes …"):
         try:
             tracked_docx = make_tracked_changes_docx(
-                original_text=uploaded_text,
-                improved_text=improved,
+                original_text=uploaded_text or "",
+                improved_text=improved or "",
                 author="ChatGPT",
             )
         except Exception as e:
@@ -371,7 +362,7 @@ if run_btn:
 st.markdown("---")
 st.markdown(
     textwrap.dedent("""
-    **Om Track Changes her:** Vi genererer WordprocessingML direkte med `<w:ins>` og `<w:del>` rundt endringer.
-    Microsoft Word skal da kjenne igjen forslagene slik at du kan trykke **Godta**/**Avvis**.
+    **Om Track Changes:** Vi genererer WordprocessingML direkte med `<w:ins>` og `<w:del>` rundt endringer.
+    Microsoft Word skal da kjenne igjen revisjoner slik at du kan trykke **Godta**/**Avvis**.
     """)
 )
