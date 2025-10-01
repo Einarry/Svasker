@@ -1,32 +1,19 @@
 # app.py
-# Streamlit app for improving medical-scientific text and producing DOCX outputs.
-# - Clean improved DOCX
-# - Track Changes DOCX (via Python-Redlines, if available)
-#
-# NOTE: Make sure your requirements include:
-#   streamlit
-#   python-docx
-#   openai
-#   python_redlines @ git+https://github.com/JSv4/Python-Redlines@v0.0.5
-#
-# And add your API key in Streamlit Cloud (App → ⋮ → Settings → Secrets):
-#   OPENAI_API_KEY = sk-...
-
 from __future__ import annotations
 
 import io
 import pathlib
+import re
 import textwrap
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+from typing import List, Tuple
 
 import streamlit as st
 from docx import Document
+from docx.text.run import Run
 from openai import OpenAI
-
-# Optional Track Changes engine (Python-Redlines). We import lazily inside a function
-# so the app still runs even if the package or runtime is missing.
-
+import difflib
 
 # -----------------------------
 # Build timestamp (Europe/Oslo)
@@ -39,16 +26,12 @@ def _build_time_oslo() -> str:
         dt = datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/Oslo"))
     return dt.strftime("%Y-%m-%d %H:%M (%Z)")
 
-
 BUILD_TIME_LOCAL = _build_time_oslo()
-
 
 # -----------------------------
 # Streamlit page config & badge
 # -----------------------------
-st.set_page_config(page_title="MedLang Improver — Track Changes", page_icon="🩺", layout="centered")
-
-# Build badge in top-left
+st.set_page_config(page_title="MedLang Improver", page_icon="🩺", layout="centered")
 st.markdown(
     f"""
     <div style="
@@ -63,15 +46,15 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🩺 Språkforbedrer for medisinske artikler — med Track Changes")
-st.markdown("Last opp Word eller lim inn tekst. Få både **ren** forbedret fil og en **.docx med Spor endringer** (når tilgjengelig).")
+st.title("🩺 Språkforbedrer for medisinske artikler")
+st.markdown("Last opp Word eller lim inn tekst. Få **ren forbedret** fil og en **visuell sammenligning** (understrek = innsatt, gjennomstreking = slettet).")
 
 # -----------------------------
 # OpenAI client
 # -----------------------------
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", None)
 if not OPENAI_API_KEY:
-    st.warning("Mangler OPENAI_API_KEY i Secrets (App → ⋮ → Settings → Secrets). Appen vil ikke kunne forbedre tekst.")
+    st.warning("Mangler OPENAI_API_KEY i Secrets (App → ⋮ → Settings → Secrets). Appen kan ikke forbedre tekst.")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # -----------------------------
@@ -141,13 +124,11 @@ SYSTEM_PROMPT = (
     "Ikke endre referanseformatering."
 )
 
-
 # -----------------------------
 # Helpers
 # -----------------------------
 def improve_text(text: str, mode: str, model_name: str) -> str:
     instr = GOALS.get(mode, GOALS["Nøytral faglig"])
-    # Chat Completions (OpenAI SDK v1)
     resp = client.chat.completions.create(
         model=model_name,
         messages=[
@@ -157,7 +138,6 @@ def improve_text(text: str, mode: str, model_name: str) -> str:
         temperature=0.2,
     )
     return resp.choices[0].message.content.strip()
-
 
 def make_docx_from_text(text: str, heading: str | None = None) -> bytes:
     d = Document()
@@ -169,27 +149,133 @@ def make_docx_from_text(text: str, heading: str | None = None) -> bytes:
     d.save(bio)
     return bio.getvalue()
 
+# --- Visual diff (no external deps) ---
+# Tokeniserer på ord + mellomrom, bevarer whitespace.
+TOKEN_RE = re.compile(r"\s+|\w+|[^\w\s]", re.UNICODE)
 
-def build_redline_docx(original_docx: bytes, improved_docx: bytes, author_tag: str = "ChatGPT") -> bytes:
+def tokenize_keep_ws(s: str) -> List[str]:
+    return TOKEN_RE.findall(s)
+
+def diff_tokens(a: List[str], b: List[str]) -> List[Tuple[str, str]]:
     """
-    Generate a real Track Changes DOCX by comparing original vs improved.
-    Uses Python-Redlines (Open-XML-PowerTools under the hood).
-    Returns bytes for the redlined DOCX or raises on failure.
+    Returnerer liste av (op, text) der op ∈ {'=', '+', '-'}
+    '=': uendret, '+': innsatt i b, '-': slettet fra a
     """
-    # Lazy import so the app can run without the dependency.
-    from python_redlines.engines import XmlPowerToolsEngine  # type: ignore
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    out: List[Tuple[str, str]] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            out.append(('=', ''.join(a[i1:i2])))
+        elif tag == 'insert':
+            out.append(('+', ''.join(b[j1:j2])))
+        elif tag == 'delete':
+            out.append(('-', ''.join(a[i1:i2])))
+        elif tag == 'replace':
+            # representer som delete + insert
+            out.append(('-', ''.join(a[i1:i2])))
+            out.append(('+', ''.join(b[j1:j2])))
+    return out
 
-    engine = XmlPowerToolsEngine()
-    # The wrapper accepts bytes or file paths; return value is bytes for the redline docx.
-    redlined_bytes = engine.run_redline(
-        author_tag=author_tag,
-        original_docx_bytes=original_docx,
-        modified_docx_bytes=improved_docx,
-    )
-    return redlined_bytes
+def make_visual_diff_docx(original_text: str, improved_text: str) -> bytes:
+    """
+    Lager en DOCX med visuell diff:
+    - Innsatt tekst: understreket
+    - Slettet tekst: gjennomstreket
+    - Uendret: normal
+    Avsnitt splittes på linjeskift for enkelhets skyld.
+    """
+    doc = Document()
+    doc.add_heading("Visuell sammenligning (ikke ekte Spor endringer)", level=1)
 
+    # Sammenlign linje for linje for å holde avsnitt strukturert
+    orig_lines = original_text.split("\n")
+    imp_lines = improved_text.split("\n")
+    max_len = max(len(orig_lines), len(imp_lines))
+
+    for idx in range(max_len):
+        a = orig_lines[idx] if idx < len(orig_lines) else ""
+        b = imp_lines[idx] if idx < len(imp_lines) else ""
+
+        p = doc.add_paragraph()
+        if not a and not b:
+            continue
+
+        a_tok = tokenize_keep_ws(a)
+        b_tok = tokenize_keep_ws(b)
+        edits = diff_tokens(a_tok, b_tok)
+
+        for op, segment in edits:
+            run: Run = p.add_run(segment)
+            if op == '+':
+                run.font.underline = True
+            elif op == '-':
+                run.font.strike = True
+                # Gjør slettede deler litt lysegrå for synlighet
+                run.font.color.rgb = None  # beholder standard; kan evt. justeres
+            else:
+                # lik tekst
+                pass
+
+    bio = io.BytesIO()
+    doc.save(bio)
+    return bio.getvalue()
 
 # -----------------------------
 # Action
 # -----------------------------
-run_btn =_
+run_btn = st.button(
+    "⚙️ Forbedre språk",
+    type="primary",
+    disabled=(not uploaded_text or not OPENAI_API_KEY),
+)
+
+if run_btn:
+    with st.spinner("Forbedrer tekst …"):
+        try:
+            improved = improve_text(uploaded_text, tone, model_name)
+        except Exception as e:
+            st.error(f"Feil fra modellen: {e}")
+            st.stop()
+
+    # Ren forbedret DOCX
+    improved_docx = make_docx_from_text(improved, "Forbedret tekst")
+
+    # Sikre original DOCX bytes for eventuell manuell sammenligning
+    if source_docx_bytes is None:
+        source_docx_bytes = make_docx_from_text(uploaded_text, "Originaltekst")
+
+    # Visuell diff DOCX (lokal, ingen eksterne avhengigheter)
+    with st.spinner("Lager visuell sammenligning …"):
+        visual_diff_bytes = make_visual_diff_docx(
+            original_text=uploaded_text,
+            improved_text=improved
+        )
+
+    st.success("Ferdig!")
+
+    st.subheader("Forhåndsvisning (ren forbedret tekst)")
+    st.text_area("Forbedret tekst", improved, height=300)
+
+    st.download_button(
+        "💾 Last ned ren forbedret Word (.docx)",
+        data=improved_docx,
+        file_name="forbedret_ren.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+    st.download_button(
+        "📝 Last ned visuell sammenligning (.docx)",
+        data=visual_diff_bytes,
+        file_name="sammenligning_visuell.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+st.markdown("---")
+st.markdown(
+    textwrap.dedent("""
+    **Merk:** Dette dokumentet med visuell sammenligning bruker understrek (innsatt) og gjennomstreking (slettet).
+    Det er ikke ekte *Spor endringer*. Hvis du trenger ekte Track Changes automatisk, kan vi koble til en
+    ekstern dokumenttjeneste (f.eks. Aspose/GroupDocs Cloud) via API-nøkler, eller du kan i Word bruke
+    **Se gjennom → Sammenlign** mellom original og forbedret.
+    """)
+)
