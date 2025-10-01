@@ -11,7 +11,6 @@ from zipfile import ZipFile
 
 import streamlit as st
 from docx import Document
-from docx.text.run import Run
 from openai import OpenAI
 import difflib
 from lxml import etree as ET  # lxml følger med via python-docx
@@ -67,14 +66,13 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 # -----------------------------
 tab1, tab2 = st.tabs(["📄 Word-fil (.docx)", "✍️ Lim inn tekst"])
 uploaded_text: str | None = None
-source_docx_bytes: bytes | None = None
 
 with tab1:
     up = st.file_uploader("Last opp .docx", type=["docx"])
     if up is not None:
         try:
-            source_docx_bytes = up.read()
-            doc = Document(io.BytesIO(source_docx_bytes))
+            src_bytes = up.read()
+            doc = Document(io.BytesIO(src_bytes))
             uploaded_text = "\n".join(p.text for p in doc.paragraphs)
         except Exception as e:
             st.error(f"Kunne ikke lese Word-filen: {e}")
@@ -236,7 +234,8 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
     def _add_del_run(parent, text: str):
         r = ET.SubElement(parent, f"{{{W_NS}}}r")
         dt = ET.SubElement(r, f"{{{W_NS}}}delText")
-        if text.startswith(" ") or text.endswith(" ""):
+        # FIXED: riktig sitat-tegn
+        if text.startswith(" ") or text.endswith(" "):
             dt.set(f"{{{XML_NS}}}space", "preserve")
         dt.text = text
 
