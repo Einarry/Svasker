@@ -13,7 +13,7 @@ import streamlit as st
 from docx import Document
 from openai import OpenAI
 import difflib
-from lxml import etree as ET  # lxml følger med via python-docx
+from lxml import etree as ET  # følger via python-docx
 
 # -----------------------------
 # Build timestamp (UTC)
@@ -32,20 +32,37 @@ BUILD_TIME_UTC = _build_time_utc()
 # -----------------------------
 st.set_page_config(page_title="MedLang Improver — ekte Track Changes", page_icon="🩺", layout="centered")
 
-# Liten badge øverst til venstre (UTC)
+# Badge øverst til venstre (synlig under Streamlits topplinje) + fallback caption
 st.markdown(
     f"""
-    <div style="
-        position: fixed; top: 8px; left: 12px;
-        padding: 4px 10px; border-radius: 8px;
-        font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        background: rgba(0,0,0,0.06); backdrop-filter: blur(2px);
-        z-index: 1000;">
-        Build: {BUILD_TIME_UTC}
-    </div>
+    <style>
+      #build-badge {{
+        position: fixed;
+        top: 64px;      /* under toppbaren */
+        left: 16px;
+        padding: 4px 10px;
+        border-radius: 8px;
+        font-size: 12px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        background: rgba(0,0,0,0.06);
+        backdrop-filter: blur(2px);
+        z-index: 9998;
+        pointer-events: none;
+      }}
+      @media (max-width: 768px) {{
+        #build-badge {{
+          position: sticky;
+          top: 0;
+          left: 0;
+          margin: 6px 0;
+        }}
+      }}
+    </style>
+    <div id="build-badge">Build: {BUILD_TIME_UTC}</div>
     """,
     unsafe_allow_html=True,
 )
+st.caption(f"Build: {BUILD_TIME_UTC}")
 
 st.title("🩺 Språkforbedrer for medisinske artikler — med Ekte Track Changes")
 st.markdown(
@@ -227,6 +244,7 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
     def _add_text_run(parent, text: str):
         r = ET.SubElement(parent, f"{{{W_NS}}}r")
         t = ET.SubElement(r, f"{{{W_NS}}}t")
+        # Bevar ledende/etterfølgende blank
         if text.startswith(" ") or text.endswith(" "):
             t.set(f"{{{XML_NS}}}space", "preserve")
         t.text = text
@@ -234,11 +252,11 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
     def _add_del_run(parent, text: str):
         r = ET.SubElement(parent, f"{{{W_NS}}}r")
         dt = ET.SubElement(r, f"{{{W_NS}}}delText")
-        # FIXED: riktig sitat-tegn
         if text.startswith(" ") or text.endswith(" "):
             dt.set(f"{{{XML_NS}}}space", "preserve")
         dt.text = text
 
+    # Del i avsnitt (linjeskift)
     orig_lines = (original_text or "").split("\n")
     imp_lines = (improved_text or "").split("\n")
     max_len = max(len(orig_lines), len(imp_lines))
@@ -283,7 +301,7 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
                 rev_id += 1
                 _add_del_run(de, seg)
 
-    # Legg til seksjonsegenskaper til slutt (Word krever at body slutter med sectPr)
+    # Legg til seksjonsegenskaper (Word krever at body slutter med sectPr)
     new_body.append(sectPr_clone)
 
     new_xml = ET.tostring(new_root, xml_declaration=True, encoding="UTF-8", standalone="yes")
