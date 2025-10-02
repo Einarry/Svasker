@@ -29,8 +29,9 @@ def _build_time_utc() -> str:
 
 BUILD_TIME_UTC = _build_time_utc()
 
-st.set_page_config(page_title="MedLang Improver — Track Changes + Ordliste", page_icon="🩺", layout="centered")
+st.set_page_config(page_title="Einars språkvasker — Track Changes + Ordliste", page_icon="🩺", layout="centered")
 
+# Kun én badge øverst til venstre
 st.markdown(
     f"""
     <style>
@@ -60,9 +61,8 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-st.caption(f"Build: {BUILD_TIME_UTC}")
 
-st.title("🩺 Språkforbedrer for medisinske artikler — Ekte Track Changes + Ordliste")
+st.title("Einars språkvasker")
 st.markdown(
     "Last opp Word eller lim inn tekst. Få **ren forbedret** fil og en **.docx med ekte Spor endringer** "
     "(Word: Godta/Avvis). Du kan laste inn en **ordliste** (CSV/JSON) lokalt eller fra **Google Drive**."
@@ -454,23 +454,25 @@ with tab2:
     if pasted and not uploaded_text:
         uploaded_text = pasted
 
-# Bruk tonesettene fra session_state["goals"]
+# Tone + modell
 tone_options = list(st.session_state["goals"].keys()) or list(DEFAULT_GOALS.keys())
 colA, colB = st.columns(2)
 with colA:
     tone = st.selectbox("Tone/retning", tone_options, help="Velg hvordan teksten skal forbedres.")
 with colB:
-    model_name = st.selectbox("Modell", ["gpt-4o-mini", "gpt-4o"], help="Mini er rimelig og rask; gpt-4o kan gi litt høyere kvalitet.")
+    default_models = ["gpt-5", "gpt-5-mini", "gpt-4o", "gpt-4o-mini"]
+    model_name = st.selectbox("Modell", default_models, index=0)
+custom_model = st.text_input("Egendefinert modellnavn (valgfritt)", placeholder="f.eks. gpt-5-chat-latest")
+if custom_model.strip():
+    model_name = custom_model.strip()
 
 st.caption("Tips: Del store manus i seksjoner (Introduksjon, Metode, Resultater, osv.) for bedre kontroll.")
 
 # =============================
-# ✏️ Rediger PROMPTS (to felter)
+# ✏️ Rediger PROMPTS (SYSTEM + GOALS for valgt tone)
 # =============================
 with st.expander("✏️ Rediger PROMPTS (SYSTEM + GOALS for valgt tone)"):
-    # SYSTEM PROMPT
     sys_text = st.text_area("SYSTEM PROMPT", st.session_state["system_prompt"], height=140)
-    # GOALS for valgt tone
     current_goal = st.session_state["goals"].get(tone, "")
     goal_text = st.text_area(f"GOALS for «{tone}»", current_goal, height=140)
 
@@ -490,7 +492,7 @@ with st.expander("✏️ Rediger PROMPTS (SYSTEM + GOALS for valgt tone)"):
             st.success("Prompter tilbakestilt til standardverdier.")
 
 # =============================
-# Ordliste-UI (ingen innholdsvisning)
+# Ordliste-UI (kompakt – ingen innholdsvisning)
 # =============================
 with st.expander("📚 Ordliste (last opp / Drive / lagre)"):
     drive_ok = drive_enabled()
@@ -500,7 +502,6 @@ with st.expander("📚 Ordliste (last opp / Drive / lagre)"):
     default_name = st.text_input("Filnavn i Drive", value="ordliste02okt.csv",
                                  help="Brukes når du leser/lagrer mot Drive.")
 
-    # Lokal opplasting (CSV/JSON)
     uploaded_gloss = st.file_uploader("Last opp ordliste (CSV/JSON)", type=["csv", "json"], key="gloss_uploader")
     if uploaded_gloss:
         try:
@@ -510,7 +511,6 @@ with st.expander("📚 Ordliste (last opp / Drive / lagre)"):
         except Exception as e:
             st.error(f"Kunne ikke lese ordlisten: {e}")
 
-    # Drive: last inn
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("📥 Last inn fra Drive", disabled=not drive_ok):
@@ -524,7 +524,6 @@ with st.expander("📚 Ordliste (last opp / Drive / lagre)"):
             except Exception as e:
                 st.error(f"Feil ved lesing fra Drive: {e}")
 
-    # Lagre til Drive (uten å vise innhold)
     with c2:
         if st.button("💾 Lagre til Drive", disabled=not drive_ok):
             try:
@@ -537,7 +536,6 @@ with st.expander("📚 Ordliste (last opp / Drive / lagre)"):
             except Exception as e:
                 st.error(f"Feil ved lagring til Drive: {e}")
 
-    # Lokal nedlasting (uten å vise innhold)
     with c3:
         gloss = st.session_state.get("glossary", {})
         if gloss:
@@ -625,9 +623,9 @@ if run_btn:
 st.markdown("---")
 st.markdown(
     textwrap.dedent("""
-    **Om ordlisten:** UI viser ikke innholdet for å spare plass. Du kan fortsatt laste opp, lagre til Drive,
+    **Ordliste:** UI viser ikke innholdet for å spare plass. Du kan likevel laste opp, lagre til Drive,
     og laste ned som CSV/JSON.  
-    **Om PROMPTS:** Du kan redigere både SYSTEM-prompten og GOALS-prompten for valgt tone. Endringer lagres i denne økten.  
-    **Om Track Changes:** Dokumentet genereres med `<w:ins>`/`<w:del>` slik at Word kan Godta/Avvise endringer.
+    **PROMPTS:** Du kan redigere både SYSTEM-prompten og GOALS-prompten for valgt tone. Endringer lagres i denne økten.  
+    **Track Changes:** Dokumentet genereres med `<w:ins>`/`<w:del>` slik at Word kan Godta/Avvise endringer.
     """)
 )
