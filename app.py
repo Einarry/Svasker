@@ -161,12 +161,6 @@ def drive_find_file(service, folder_id: str, name: str):
     files = resp.get("files", [])
     return files[0] if files else None
 
-def drive_find_file(service, folder_id: str, name: str):
-    q = f"'{folder_id}' in parents and name = '{name}' and trashed = false"
-    resp = service.files().list(q=q, fields="files(id, name)").execute()
-    files = resp.get("files", [])
-    return files[0] if files else None
-
 def drive_upload_bytes(service, folder_id: str, name: str, data: bytes, mime: str):
     from googleapiclient.http import MediaIoBaseUpload
     existing = drive_find_file(service, folder_id, name)
@@ -644,4 +638,5 @@ st.markdown(
     **Track Changes:** Dokumentet genereres med `<w:ins>`/`<w:del>` slik at Word kan Godta/Avvise endringer.
     """)
 )
+
 
