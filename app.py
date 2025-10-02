@@ -31,13 +31,12 @@ BUILD_TIME_UTC = _build_time_utc()
 
 st.set_page_config(page_title="MedLang Improver — Track Changes + Ordliste", page_icon="🩺", layout="centered")
 
-# Badge øverst til venstre (synlig under Streamlits topplinje) + fallback caption
 st.markdown(
     f"""
     <style>
       #build-badge {{
         position: fixed;
-        top: 64px;      /* under toppbaren */
+        top: 64px;
         left: 16px;
         padding: 4px 10px;
         border-radius: 8px;
@@ -78,31 +77,71 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # =============================
-# Google Drive-klient (valgfritt)
+# Standard-prompter (initiale verdier)
+# =============================
+DEFAULT_GOALS: Dict[str, str] = {
+    "Nøytral faglig": (
+        "Forbedre klarhet, flyt og grammatikk i vitenskapelig medisinsk tekst. "
+        "Behold betydning, referanser og tall uendret. Unngå nye påstander."
+    ),
+    "Mer konsis": (
+        "Forbedre klarhet og gjør teksten mer konsis uten å endre faglig innhold. "
+        "Behold referanser og tall. Fjern fyllord."
+    ),
+    "Mer formell": (
+        "Hev formalitetsnivå, vitenskapelig stil, presis terminologi og grammatikk. "
+        "Ikke legg til nye påstander."
+    ),
+    "For legfaglig publikum": (
+        "Forenkle språket lett og forklar forkortelser der det er naturlig, men behold presisjon. "
+        "Ikke endre data eller resultater."
+    ),
+}
+
+DEFAULT_SYSTEM_PROMPT = (
+    "Du er språkredaktør for medisinske manus. "
+    "Respekter faglig innhold, data, referanser (f.eks. [12], (Smith 2020), DOI), og numerikk. "
+    "Ikke legg til, fjern eller omtolk resultater. "
+    "Ikke endre referanseformatering."
+)
+
+# Legg i session_state hvis ikke finnes fra før
+if "goals" not in st.session_state:
+    st.session_state["goals"] = DEFAULT_GOALS.copy()
+if "system_prompt" not in st.session_state:
+    st.session_state["system_prompt"] = DEFAULT_SYSTEM_PROMPT
+
+# =============================
+# Google Drive-støtte (valgfritt)
 # =============================
 def drive_enabled() -> bool:
     return "GDRIVE_SERVICE_ACCOUNT_JSON" in st.secrets and "GDRIVE_FOLDER_ID" in st.secrets
 
+def _folder_id_from_secret() -> str:
+    raw = st.secrets["GDRIVE_FOLDER_ID"].strip()
+    m = re.search(r"/folders/([a-zA-Z0-9_-]+)", raw)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", raw)
+    if m:
+        return m.group(1)
+    return raw
+
 def _drive_service():
+    # robust parser som reparerer private_key-linjeskift hvis feil limt inn
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
-    import json, re
-
     raw = st.secrets["GDRIVE_SERVICE_ACCOUNT_JSON"]
-
     try:
         info = json.loads(raw)
     except json.JSONDecodeError:
-        # Forsøk å "reparere" hvis private_key har ekte linjeskift
         m = re.search(r'"private_key"\s*:\s*"(.*?)"', raw, flags=re.DOTALL)
         if not m:
-            raise  # noe annet er galt
+            raise
         key_content = m.group(1)
-        # erstatt CR/LF inne i private_key med \n
         fixed_key = key_content.replace("\r\n", "\\n").replace("\n", "\\n")
-        raw_fixed = raw[:m.start(1)] + fixed_key + raw[m.end(1):]
-        info = json.loads(raw_fixed)
-
+        raw = raw[:m.start(1)] + fixed_key + raw[m.end(1):]
+        info = json.loads(raw)
     scopes = ["https://www.googleapis.com/auth/drive.file"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return build("drive", "v3", credentials=creds)
@@ -134,21 +173,20 @@ def drive_download_bytes(service, file_id: str) -> bytes:
         _, done = downloader.next_chunk()
     return bio.getvalue()
 
-def save_glossary_to_drive(gloss: Dict[str, List[str]], filename="ordliste02okt.csv"):
+def save_glossary_to_drive(gloss: Dict[str, List[str]], filename="ordliste.csv"):
     service = _drive_service()
-    folder_id = st.secrets["GDRIVE_FOLDER_ID"]
+    folder_id = _folder_id_from_secret()
     data = dump_glossary_csv(gloss) if filename.lower().endswith(".csv") else dump_glossary_json(gloss)
     mime = "text/csv" if filename.lower().endswith(".csv") else "application/json"
     drive_upload_bytes(service, folder_id, filename, data, mime)
 
-def load_glossary_from_drive(filename="ordliste02okt.csv") -> Dict[str, List[str]] | None:
+def load_glossary_from_drive(filename="ordliste.csv") -> Dict[str, List[str]] | None:
     service = _drive_service()
-    folder_id = st.secrets["GDRIVE_FOLDER_ID"]
+    folder_id = _folder_id_from_secret()
     f = drive_find_file(service, folder_id, filename)
     if not f:
         return None
     data = drive_download_bytes(service, f["id"])
-    # autodetect by extension
     if filename.lower().endswith(".json"):
         obj = json.loads(data.decode("utf-8"))
         if isinstance(obj, list):
@@ -157,12 +195,11 @@ def load_glossary_from_drive(filename="ordliste02okt.csv") -> Dict[str, List[str
             return {k: list(v) if isinstance(v, (list, tuple)) else ([str(v)] if v else []) for k, v in obj.items()}
         else:
             raise ValueError("JSON må være liste eller objekt.")
-    # CSV
     text = data.decode("utf-8")
     return _parse_glossary_csv_text(text)
 
 # =============================
-# Ordliste: last/lagre + bruk
+# Ordliste: parse/lagre + bruk
 # =============================
 TOKEN_SEP = re.compile(r"[;|]")
 
@@ -194,7 +231,6 @@ def _parse_glossary_csv_text(text: str) -> Dict[str, List[str]]:
                 if s and s not in gloss[pref]:
                     gloss[pref].append(s)
     else:
-        # én kolonne (preferred-only)
         for r in rows:
             if r and r[0].strip().lower() != "preferred":
                 pref = r[0].strip()
@@ -215,7 +251,6 @@ def load_glossary_file(file) -> Dict[str, List[str]]:
             return {k: list(v) if isinstance(v, (list, tuple)) else ([str(v)] if v else []) for k, v in obj.items()}
         else:
             raise ValueError("JSON må være liste eller objekt.")
-    # CSV
     text = data.decode("utf-8")
     return _parse_glossary_csv_text(text)
 
@@ -232,7 +267,6 @@ def dump_glossary_json(gloss: Dict[str, List[str]]) -> bytes:
     return json.dumps(gloss, ensure_ascii=False, indent=2).encode("utf-8")
 
 def _match_case(repl: str, src: str) -> str:
-    """Bevar enkle kasusmønstre (små/Stor/STORE)."""
     if src.isupper():
         return repl.upper()
     if len(src) > 1 and src[0].isupper() and src[1:].islower():
@@ -240,7 +274,6 @@ def _match_case(repl: str, src: str) -> str:
     return repl
 
 def apply_glossary(text: str, glossary: Dict[str, List[str]]) -> str:
-    """Erstatter kjente synonymer med foretrukket term (ordgrenser, case-bevaring)."""
     if not glossary:
         return text
     out = text
@@ -253,44 +286,20 @@ def apply_glossary(text: str, glossary: Dict[str, List[str]]) -> str:
     return out
 
 # =============================
-# Prompt-oppsett
+# Modeller & prompts
 # =============================
-GOALS = {
-    "Nøytral faglig": (
-        "Forbedre klarhet, flyt og grammatikk i vitenskapelig medisinsk tekst. "
-        "Behold betydning, referanser og tall uendret. Unngå nye påstander."
-    ),
-    "Mer konsis": (
-        "Forbedre klarhet og gjør teksten mer konsis uten å endre faglig innhold. "
-        "Behold referanser og tall. Fjern fyllord."
-    ),
-    "Mer formell": (
-        "Hev formalitetsnivå, vitenskapelig stil, presis terminologi og grammatikk. "
-        "Ikke legg til nye påstander."
-    ),
-    "For legfaglig publikum": (
-        "Forenkle språket lett og forklar forkortelser der det er naturlig, men behold presisjon. "
-        "Ikke endre data eller resultater."
-    ),
-}
-
-SYSTEM_PROMPT = (
-    "Du er språkredaktør for medisinske manus. "
-    "Respekter faglig innhold, data, referanser (f.eks. [12], (Smith 2020), DOI), og numerikk. "
-    "Ikke legg til, fjern eller omtolk resultater. "
-    "Ikke endre referanseformatering."
-)
-
 def improve_text(text: str, mode: str, model_name: str, glossary_note: str | None) -> str:
     if not client:
         raise RuntimeError("OPENAI_API_KEY mangler – kan ikke kalle modellen.")
-    instr = GOALS.get(mode, GOALS["Nøytral faglig"])
+    system_prompt = st.session_state["system_prompt"]
+    goals_map: Dict[str, str] = st.session_state["goals"]
+    instr = goals_map.get(mode, list(goals_map.values())[0] if goals_map else DEFAULT_GOALS["Nøytral faglig"])
     if glossary_note:
         instr = instr + "\n\n" + glossary_note
     resp = client.chat.completions.create(
         model=model_name,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"{instr}\n\nTekst:\n{text}"},
         ],
         temperature=0.2,
@@ -306,10 +315,6 @@ def tokenize_keep_ws(s: str) -> List[str]:
     return TOKEN_RE.findall(s)
 
 def diff_tokens(a: List[str], b: List[str]) -> List[Tuple[str, str]]:
-    """
-    Returnerer liste av (op, text) der op ∈ {'=', '+', '-'}
-    '=': uendret, '+': innsatt i b, '-': slettet fra a
-    """
     sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
     out: List[Tuple[str, str]] = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -345,11 +350,6 @@ def make_docx_from_text(text: str, heading: str | None = None) -> bytes:
     return bio.getvalue()
 
 def make_tracked_changes_docx(original_text: str, improved_text: str, author: str = "ChatGPT") -> bytes:
-    """
-    Bygger et .docx med ekte revisjoner:
-    <w:ins>/<w:del> rundt endringer, slik at Word kan Godta/Avvise.
-    """
-    # Base DOCX for standard styles/sectPr
     base_doc = Document()
     base_bio = io.BytesIO()
     base_doc.save(base_bio)
@@ -408,25 +408,15 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
                 _add_text_run(p, seg)
             elif op == "+":
                 ins = ET.SubElement(
-                    p,
-                    f"{{{W_NS}}}ins",
-                    {
-                        f"{{{W_NS}}}author": author,
-                        f"{{{W_NS}}}date": now_iso,
-                        f"{{{W_NS}}}id": str(rev_id),
-                    },
+                    p, f"{{{W_NS}}}ins",
+                    {f"{{{W_NS}}}author": author, f"{{{W_NS}}}date": now_iso, f"{{{W_NS}}}id": str(rev_id)}
                 )
                 rev_id += 1
                 _add_text_run(ins, seg)
             elif op == "-":
                 de = ET.SubElement(
-                    p,
-                    f"{{{W_NS}}}del",
-                    {
-                        f"{{{W_NS}}}author": author,
-                        f"{{{W_NS}}}date": now_iso,
-                        f"{{{W_NS}}}id": str(rev_id),
-                    },
+                    p, f"{{{W_NS}}}del",
+                    {f"{{{W_NS}}}author": author, f"{{{W_NS}}}date": now_iso, f"{{{W_NS}}}id": str(rev_id)}
                 )
                 rev_id += 1
                 _add_del_run(de, seg)
@@ -441,11 +431,10 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
             if item.filename == "word/document.xml":
                 data = new_xml
             zout.writestr(item, data)
-
     return out_bio.getvalue()
 
 # =============================
-# UI: input tekst / modellvalg
+# UI: tekstinn og modellvalg
 # =============================
 tab1, tab2 = st.tabs(["📄 Word-fil (.docx)", "✍️ Lim inn tekst"])
 uploaded_text: str | None = None
@@ -465,60 +454,78 @@ with tab2:
     if pasted and not uploaded_text:
         uploaded_text = pasted
 
+# Bruk tonesettene fra session_state["goals"]
+tone_options = list(st.session_state["goals"].keys()) or list(DEFAULT_GOALS.keys())
 colA, colB = st.columns(2)
 with colA:
-    tone = st.selectbox(
-        "Tone/retning",
-        ["Nøytral faglig", "Mer konsis", "Mer formell", "For legfaglig publikum"],
-        help="Velg hvordan teksten skal forbedres.",
-    )
+    tone = st.selectbox("Tone/retning", tone_options, help="Velg hvordan teksten skal forbedres.")
 with colB:
-    model_name = st.selectbox(
-        "Modell",
-        ["gpt-4o-mini", "gpt-4o"],
-        help="Mini er rimelig og rask; gpt-4o kan gi litt høyere kvalitet.",
-    )
+    model_name = st.selectbox("Modell", ["gpt-4o-mini", "gpt-4o"], help="Mini er rimelig og rask; gpt-4o kan gi litt høyere kvalitet.")
 
 st.caption("Tips: Del store manus i seksjoner (Introduksjon, Metode, Resultater, osv.) for bedre kontroll.")
 
 # =============================
-# Ordliste-UI (lokal + Drive)
+# ✏️ Rediger PROMPTS (to felter)
 # =============================
-with st.expander("📚 Ordliste (last opp, se, lagre)"):
+with st.expander("✏️ Rediger PROMPTS (SYSTEM + GOALS for valgt tone)"):
+    # SYSTEM PROMPT
+    sys_text = st.text_area("SYSTEM PROMPT", st.session_state["system_prompt"], height=140)
+    # GOALS for valgt tone
+    current_goal = st.session_state["goals"].get(tone, "")
+    goal_text = st.text_area(f"GOALS for «{tone}»", current_goal, height=140)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("💾 Lagre SYSTEM PROMPT"):
+            st.session_state["system_prompt"] = sys_text
+            st.success("System-prompt lagret.")
+    with c2:
+        if st.button("💾 Lagre GOALS for valgt tone"):
+            st.session_state["goals"][tone] = goal_text
+            st.success(f"GOALS for «{tone}» lagret.")
+    with c3:
+        if st.button("↩️ Tilbakestill til standard"):
+            st.session_state["system_prompt"] = DEFAULT_SYSTEM_PROMPT
+            st.session_state["goals"] = DEFAULT_GOALS.copy()
+            st.success("Prompter tilbakestilt til standardverdier.")
+
+# =============================
+# Ordliste-UI (ingen innholdsvisning)
+# =============================
+with st.expander("📚 Ordliste (last opp / Drive / lagre)"):
     drive_ok = drive_enabled()
-    if drive_ok:
-        st.success("Google Drive er konfigurert.")
-    else:
-        st.info("Google Drive er ikke konfigurert (legg inn GDRIVE_SERVICE_ACCOUNT_JSON og GDRIVE_FOLDER_ID i Secrets).")
+    st.info(("Google Drive er konfigurert." if drive_ok else
+             "Google Drive er ikke konfigurert (legg inn GDRIVE_SERVICE_ACCOUNT_JSON og GDRIVE_FOLDER_ID i Secrets)."))
 
-    default_name = st.text_input("Filnavn i Drive", value="ordliste02okt.csv", help="Bruker denne når du laster inn/lagrer mot Drive.")
+    default_name = st.text_input("Filnavn i Drive", value="ordliste02okt.csv",
+                                 help="Brukes når du leser/lagrer mot Drive.")
 
-    # Last opp lokalt
-    uploaded_gloss = st.file_uploader("Last opp ordliste (CSV eller JSON)", type=["csv", "json"], key="gloss_uploader")
+    # Lokal opplasting (CSV/JSON)
+    uploaded_gloss = st.file_uploader("Last opp ordliste (CSV/JSON)", type=["csv", "json"], key="gloss_uploader")
     if uploaded_gloss:
         try:
             gloss = load_glossary_file(uploaded_gloss)
             st.session_state["glossary"] = gloss
-            st.success(f"Lastet {len(gloss)} foretrukne termer fra opplastet fil.")
+            st.success(f"Ordlistestatus: {len(gloss)} foretrukne termer lastet.")
         except Exception as e:
             st.error(f"Kunne ikke lese ordlisten: {e}")
 
-    # Last inn fra Drive
-    cols = st.columns(2)
-    with cols[0]:
+    # Drive: last inn
+    c1, c2, c3 = st.columns(3)
+    with c1:
         if st.button("📥 Last inn fra Drive", disabled=not drive_ok):
             try:
                 g = load_glossary_from_drive(default_name)
                 if g is None:
-                    st.warning(f"Fant ikke '{default_name}' i Drive-mappen.")
+                    st.warning(f"Fant ikke «{default_name}» i Drive-mappen.")
                 else:
                     st.session_state["glossary"] = g
-                    st.success(f"Lastet {len(g)} termer fra Drive.")
+                    st.success(f"Ordlistestatus: {len(g)} termer lastet fra Drive.")
             except Exception as e:
                 st.error(f"Feil ved lesing fra Drive: {e}")
 
-    # Lagre til Drive
-    with cols[1]:
+    # Lagre til Drive (uten å vise innhold)
+    with c2:
         if st.button("💾 Lagre til Drive", disabled=not drive_ok):
             try:
                 gloss = st.session_state.get("glossary", {})
@@ -526,38 +533,28 @@ with st.expander("📚 Ordliste (last opp, se, lagre)"):
                     st.warning("Ingen ordliste i minnet å lagre. Last opp eller last inn først.")
                 else:
                     save_glossary_to_drive(gloss, default_name)
-                    st.success(f"Lagret ordliste som '{default_name}' i Drive-mappen.")
+                    st.success(f"Lagret ordliste som «{default_name}» i Drive-mappen.")
             except Exception as e:
                 st.error(f"Feil ved lagring til Drive: {e}")
 
-    # Vis gjeldende ordliste + lokal nedlasting
-    gloss = st.session_state.get("glossary", {})
-    if gloss:
-        st.write("**Gjeldende ordliste (utdrag):**")
-        preview_rows = []
-        for i, (pref, syns) in enumerate(gloss.items()):
-            if i >= 50:
-                preview_rows.append({"preferred": "…", "synonyms": "…"})
-                break
-            preview_rows.append({"preferred": pref, "synonyms": "; ".join(syns)})
-        st.table(preview_rows)
-
-        dcols = st.columns(2)
-        with dcols[0]:
+    # Lokal nedlasting (uten å vise innhold)
+    with c3:
+        gloss = st.session_state.get("glossary", {})
+        if gloss:
             data_csv = dump_glossary_csv(gloss)
-            st.download_button("⬇️ Last ned CSV", data=data_csv, file_name="ordliste.csv", mime="text/csv")
-        with dcols[1]:
             data_json = dump_glossary_json(gloss)
+            st.download_button("⬇️ Last ned CSV", data=data_csv, file_name="ordliste.csv", mime="text/csv")
             st.download_button("⬇️ Last ned JSON", data=data_json, file_name="ordliste.json", mime="application/json")
-    else:
-        st.info("Ingen ordliste lastet enda. Du kan fortsette uten, eller laste opp/inn over.")
+        else:
+            st.caption("Ingen ordliste lastet enda.")
 
 # =============================
 # Kjøring
 # =============================
 use_glossary_in_prompt = st.checkbox("Gi modellen beskjed om å bruke ordlisten (anbefalt)", value=True,
                                      help="Legger en kort instruks om prefererte termer inn i prompten.")
-author_tag = st.text_input("Forfatter-tag for Track Changes", value="ChatGPT", help="Vises i Word som forfatter av endringer.")
+author_tag = st.text_input("Forfatter-tag for Track Changes", value="ChatGPT",
+                           help="Vises i Word som forfatter av endringer.")
 
 run_btn = st.button(
     "⚙️ Forbedre språk og lag Ekte Track Changes",
@@ -577,7 +574,6 @@ if run_btn:
 
     glossary_note = None
     if use_glossary_in_prompt and glossary:
-        # kort instruks til modellen
         preferred_list = "\n".join(f"- {p}" for p in list(glossary.keys())[:100])
         glossary_note = (
             "Bruk følgende prefererte termer konsekvent; normaliser eventuelle synonymer/varianter til eksakt skrivemåte:\n"
@@ -591,13 +587,10 @@ if run_btn:
             st.error(f"Feil fra modellen: {e}")
             st.stop()
 
-    # Deterministisk terminologi-normalisering uavhengig av modell
     final_text = apply_glossary(improved, glossary) if glossary else improved
 
-    # Ren forbedret DOCX
     improved_docx = make_docx_from_text(final_text, "Forbedret tekst")
 
-    # Ekte Track Changes DOCX (diff original vs final)
     with st.spinner("Genererer ekte Track Changes …"):
         try:
             tracked_docx = make_tracked_changes_docx(
@@ -632,10 +625,9 @@ if run_btn:
 st.markdown("---")
 st.markdown(
     textwrap.dedent("""
-    **Om ordlisten:** Du kan laste opp CSV/JSON lokalt eller jobbe direkte mot Google Drive.
-    CSV-format støtter enten én kolonne `preferred`, eller to kolonner `preferred,synonyms`
-    (der `synonyms` kan være semikolon- eller pipe-separert: `a; b|c`).
+    **Om ordlisten:** UI viser ikke innholdet for å spare plass. Du kan fortsatt laste opp, lagre til Drive,
+    og laste ned som CSV/JSON.  
+    **Om PROMPTS:** Du kan redigere både SYSTEM-prompten og GOALS-prompten for valgt tone. Endringer lagres i denne økten.  
     **Om Track Changes:** Dokumentet genereres med `<w:ins>`/`<w:del>` slik at Word kan Godta/Avvise endringer.
     """)
 )
-
