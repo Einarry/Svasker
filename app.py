@@ -127,24 +127,39 @@ def _folder_id_from_secret() -> str:
         return m.group(1)
     return raw
 
-def _drive_service():
-    # robust parser som reparerer private_key-linjeskift hvis feil limt inn
-    from google.oauth2.service_account import Credentials
-    from googleapiclient.discovery import build
-    raw = st.secrets["GDRIVE_SERVICE_ACCOUNT_JSON"]
-    try:
-        info = json.loads(raw)
-    except json.JSONDecodeError:
-        m = re.search(r'"private_key"\s*:\s*"(.*?)"', raw, flags=re.DOTALL)
-        if not m:
-            raise
-        key_content = m.group(1)
-        fixed_key = key_content.replace("\r\n", "\\n").replace("\n", "\\n")
-        raw = raw[:m.start(1)] + fixed_key + raw[m.end(1):]
-        info = json.loads(raw)
-    scopes = ["https://www.googleapis.com/auth/drive.file"]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    return build("drive", "v3", credentials=creds)
+def drive_find_file(service, folder_id: str, name: str):
+    """Finn fil i mappe ved robust navnematch (case/whitespace-insensitiv)."""
+    def _norm(s: str) -> str:
+        # trim, normaliser whitespace og små bokstaver
+        return re.sub(r"\s+", " ", s).strip().lower()
+
+    target_norm = _norm(name)
+
+    # 1) List alt i mappen (paginert) og sammenlikn lokalt
+    page_token = None
+    while True:
+        resp = service.files().list(
+            q=f"'{folder_id}' in parents and trashed = false",
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageSize=1000,
+            pageToken=page_token,
+        ).execute()
+        for f in resp.get("files", []):
+            if _norm(f["name"]) == target_norm:
+                return f
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    # 2) Fallback: prøv et 'contains' på navnet uten filendelse
+    base = name.rsplit(".", 1)[0]
+    resp = service.files().list(
+        q=f"'{folder_id}' in parents and name contains '{base}' and trashed = false",
+        fields="files(id, name, mimeType)",
+        pageSize=50,
+    ).execute()
+    files = resp.get("files", [])
+    return files[0] if files else None
 
 def drive_find_file(service, folder_id: str, name: str):
     q = f"'{folder_id}' in parents and name = '{name}' and trashed = false"
@@ -629,3 +644,4 @@ st.markdown(
     **Track Changes:** Dokumentet genereres med `<w:ins>`/`<w:del>` slik at Word kan Godta/Avvise endringer.
     """)
 )
+
