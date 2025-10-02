@@ -86,7 +86,23 @@ def drive_enabled() -> bool:
 def _drive_service():
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
-    info = json.loads(st.secrets["GDRIVE_SERVICE_ACCOUNT_JSON"])
+    import json, re
+
+    raw = st.secrets["GDRIVE_SERVICE_ACCOUNT_JSON"]
+
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError:
+        # Forsøk å "reparere" hvis private_key har ekte linjeskift
+        m = re.search(r'"private_key"\s*:\s*"(.*?)"', raw, flags=re.DOTALL)
+        if not m:
+            raise  # noe annet er galt
+        key_content = m.group(1)
+        # erstatt CR/LF inne i private_key med \n
+        fixed_key = key_content.replace("\r\n", "\\n").replace("\n", "\\n")
+        raw_fixed = raw[:m.start(1)] + fixed_key + raw[m.end(1):]
+        info = json.loads(raw_fixed)
+
     scopes = ["https://www.googleapis.com/auth/drive.file"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return build("drive", "v3", credentials=creds)
@@ -622,3 +638,4 @@ st.markdown(
     **Om Track Changes:** Dokumentet genereres med `<w:ins>`/`<w:del>` slik at Word kan Godta/Avvise endringer.
     """)
 )
+
