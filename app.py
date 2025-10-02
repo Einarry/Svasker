@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import io
+import csv
+import json
 import pathlib
 import re
 import textwrap
 from datetime import datetime, timezone
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 from zipfile import ZipFile
 
 import streamlit as st
@@ -15,9 +17,9 @@ from openai import OpenAI
 import difflib
 from lxml import etree as ET  # følger via python-docx
 
-# -----------------------------
-# Build timestamp (UTC)
-# -----------------------------
+# =============================
+# Build timestamp (UTC) + badge
+# =============================
 def _build_time_utc() -> str:
     try:
         ts = pathlib.Path(__file__).stat().st_mtime
@@ -27,10 +29,7 @@ def _build_time_utc() -> str:
 
 BUILD_TIME_UTC = _build_time_utc()
 
-# -----------------------------
-# Streamlit page config & badge
-# -----------------------------
-st.set_page_config(page_title="MedLang Improver — ekte Track Changes", page_icon="🩺", layout="centered")
+st.set_page_config(page_title="MedLang Improver — Track Changes + Ordliste", page_icon="🩺", layout="centered")
 
 # Badge øverst til venstre (synlig under Streamlits topplinje) + fallback caption
 st.markdown(
@@ -64,60 +63,182 @@ st.markdown(
 )
 st.caption(f"Build: {BUILD_TIME_UTC}")
 
-st.title("🩺 Språkforbedrer for medisinske artikler — med Ekte Track Changes")
+st.title("🩺 Språkforbedrer for medisinske artikler — Ekte Track Changes + Ordliste")
 st.markdown(
     "Last opp Word eller lim inn tekst. Få **ren forbedret** fil og en **.docx med ekte Spor endringer** "
-    "(Word: Godta/Avvis endringer)."
+    "(Word: Godta/Avvis). Du kan laste inn en **ordliste** (CSV/JSON) lokalt eller fra **Google Drive**."
 )
 
-# -----------------------------
+# =============================
 # OpenAI client
-# -----------------------------
+# =============================
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", None)
 if not OPENAI_API_KEY:
     st.warning("Mangler OPENAI_API_KEY i Secrets (App → ⋮ → Settings → Secrets). Appen kan ikke forbedre tekst.")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# -----------------------------
-# UI: input
-# -----------------------------
-tab1, tab2 = st.tabs(["📄 Word-fil (.docx)", "✍️ Lim inn tekst"])
-uploaded_text: str | None = None
+# =============================
+# Google Drive-klient (valgfritt)
+# =============================
+def drive_enabled() -> bool:
+    return "GDRIVE_SERVICE_ACCOUNT_JSON" in st.secrets and "GDRIVE_FOLDER_ID" in st.secrets
 
-with tab1:
-    up = st.file_uploader("Last opp .docx", type=["docx"])
-    if up is not None:
-        try:
-            src_bytes = up.read()
-            doc = Document(io.BytesIO(src_bytes))
-            uploaded_text = "\n".join(p.text for p in doc.paragraphs)
-        except Exception as e:
-            st.error(f"Kunne ikke lese Word-filen: {e}")
+def _drive_service():
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+    info = json.loads(st.secrets["GDRIVE_SERVICE_ACCOUNT_JSON"])
+    scopes = ["https://www.googleapis.com/auth/drive.file"]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return build("drive", "v3", credentials=creds)
 
-with tab2:
-    pasted = st.text_area("Lim inn tekst her", height=300, placeholder="Lim inn manus her …")
-    if pasted and not uploaded_text:
-        uploaded_text = pasted
+def drive_find_file(service, folder_id: str, name: str):
+    q = f"'{folder_id}' in parents and name = '{name}' and trashed = false"
+    resp = service.files().list(q=q, fields="files(id, name)").execute()
+    files = resp.get("files", [])
+    return files[0] if files else None
 
-colA, colB = st.columns(2)
-with colA:
-    tone = st.selectbox(
-        "Tone/retning",
-        ["Nøytral faglig", "Mer konsis", "Mer formell", "For legfaglig publikum"],
-        help="Velg hvordan teksten skal forbedres.",
-    )
-with colB:
-    model_name = st.selectbox(
-        "Modell",
-        ["gpt-4o-mini", "gpt-4o"],
-        help="Mini er rimelig og rask; gpt-4o kan gi litt høyere kvalitet.",
-    )
+def drive_upload_bytes(service, folder_id: str, name: str, data: bytes, mime: str):
+    from googleapiclient.http import MediaIoBaseUpload
+    existing = drive_find_file(service, folder_id, name)
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
+    if existing:
+        service.files().update(fileId=existing["id"], media_body=media).execute()
+        return existing["id"]
+    meta = {"name": name, "parents": [folder_id]}
+    file = service.files().create(body=meta, media_body=media, fields="id").execute()
+    return file["id"]
 
-st.caption("Tips: Del store manus i seksjoner (Introduksjon, Metode, Resultater, osv.) for bedre kontroll.")
+def drive_download_bytes(service, file_id: str) -> bytes:
+    from googleapiclient.http import MediaIoBaseDownload
+    req = service.files().get_media(fileId=file_id)
+    bio = io.BytesIO()
+    downloader = MediaIoBaseDownload(bio, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return bio.getvalue()
 
-# -----------------------------
-# Prompts
-# -----------------------------
+def save_glossary_to_drive(gloss: Dict[str, List[str]], filename="ordliste02okt.csv"):
+    service = _drive_service()
+    folder_id = st.secrets["GDRIVE_FOLDER_ID"]
+    data = dump_glossary_csv(gloss) if filename.lower().endswith(".csv") else dump_glossary_json(gloss)
+    mime = "text/csv" if filename.lower().endswith(".csv") else "application/json"
+    drive_upload_bytes(service, folder_id, filename, data, mime)
+
+def load_glossary_from_drive(filename="ordliste02okt.csv") -> Dict[str, List[str]] | None:
+    service = _drive_service()
+    folder_id = st.secrets["GDRIVE_FOLDER_ID"]
+    f = drive_find_file(service, folder_id, filename)
+    if not f:
+        return None
+    data = drive_download_bytes(service, f["id"])
+    # autodetect by extension
+    if filename.lower().endswith(".json"):
+        obj = json.loads(data.decode("utf-8"))
+        if isinstance(obj, list):
+            return {term: [] for term in obj}
+        elif isinstance(obj, dict):
+            return {k: list(v) if isinstance(v, (list, tuple)) else ([str(v)] if v else []) for k, v in obj.items()}
+        else:
+            raise ValueError("JSON må være liste eller objekt.")
+    # CSV
+    text = data.decode("utf-8")
+    return _parse_glossary_csv_text(text)
+
+# =============================
+# Ordliste: last/lagre + bruk
+# =============================
+TOKEN_SEP = re.compile(r"[;|]")
+
+def _parse_glossary_csv_text(text: str) -> Dict[str, List[str]]:
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        return {}
+    header = [h.strip().lower() for h in rows[0]]
+    gloss: Dict[str, List[str]] = {}
+
+    def parse_syns(s: str) -> List[str]:
+        if not s:
+            return []
+        parts = TOKEN_SEP.split(s)
+        return [p.strip() for p in parts if p.strip()]
+
+    if "preferred" in header:
+        idx_pref = header.index("preferred")
+        idx_syn = header.index("synonyms") if "synonyms" in header else None
+        for r in rows[1:]:
+            if not r or len(r) <= idx_pref:
+                continue
+            pref = r[idx_pref].strip()
+            if not pref:
+                continue
+            syns = parse_syns(r[idx_syn]) if idx_syn is not None and len(r) > idx_syn else []
+            gloss.setdefault(pref, [])
+            for s in syns:
+                if s and s not in gloss[pref]:
+                    gloss[pref].append(s)
+    else:
+        # én kolonne (preferred-only)
+        for r in rows:
+            if r and r[0].strip().lower() != "preferred":
+                pref = r[0].strip()
+                if pref:
+                    gloss.setdefault(pref, [])
+    return gloss
+
+def load_glossary_file(file) -> Dict[str, List[str]]:
+    name = getattr(file, "name", "").lower()
+    data = file.read()
+    if hasattr(file, "seek"):
+        file.seek(0)
+    if name.endswith(".json"):
+        obj = json.loads(data.decode("utf-8"))
+        if isinstance(obj, list):
+            return {term: [] for term in obj}
+        elif isinstance(obj, dict):
+            return {k: list(v) if isinstance(v, (list, tuple)) else ([str(v)] if v else []) for k, v in obj.items()}
+        else:
+            raise ValueError("JSON må være liste eller objekt.")
+    # CSV
+    text = data.decode("utf-8")
+    return _parse_glossary_csv_text(text)
+
+def dump_glossary_csv(gloss: Dict[str, List[str]]) -> bytes:
+    buff = io.StringIO()
+    w = csv.writer(buff)
+    w.writerow(["preferred", "synonyms"])
+    for pref, syns in gloss.items():
+        s = "; ".join(syns) if syns else ""
+        w.writerow([pref, s])
+    return buff.getvalue().encode("utf-8")
+
+def dump_glossary_json(gloss: Dict[str, List[str]]) -> bytes:
+    return json.dumps(gloss, ensure_ascii=False, indent=2).encode("utf-8")
+
+def _match_case(repl: str, src: str) -> str:
+    """Bevar enkle kasusmønstre (små/Stor/STORE)."""
+    if src.isupper():
+        return repl.upper()
+    if len(src) > 1 and src[0].isupper() and src[1:].islower():
+        return repl.capitalize()
+    return repl
+
+def apply_glossary(text: str, glossary: Dict[str, List[str]]) -> str:
+    """Erstatter kjente synonymer med foretrukket term (ordgrenser, case-bevaring)."""
+    if not glossary:
+        return text
+    out = text
+    for preferred, syns in glossary.items():
+        for s in set(syns):
+            if not s or s.strip().lower() == preferred.strip().lower():
+                continue
+            pattern = re.compile(rf"\b{re.escape(s)}\b", flags=re.IGNORECASE)
+            out = pattern.sub(lambda m: _match_case(preferred, m.group(0)), out)
+    return out
+
+# =============================
+# Prompt-oppsett
+# =============================
 GOALS = {
     "Nøytral faglig": (
         "Forbedre klarhet, flyt og grammatikk i vitenskapelig medisinsk tekst. "
@@ -144,13 +265,12 @@ SYSTEM_PROMPT = (
     "Ikke endre referanseformatering."
 )
 
-# -----------------------------
-# Helpers: forbedring
-# -----------------------------
-def improve_text(text: str, mode: str, model_name: str) -> str:
-    instr = GOALS.get(mode, GOALS["Nøytral faglig"])
+def improve_text(text: str, mode: str, model_name: str, glossary_note: str | None) -> str:
     if not client:
         raise RuntimeError("OPENAI_API_KEY mangler – kan ikke kalle modellen.")
+    instr = GOALS.get(mode, GOALS["Nøytral faglig"])
+    if glossary_note:
+        instr = instr + "\n\n" + glossary_note
     resp = client.chat.completions.create(
         model=model_name,
         messages=[
@@ -161,19 +281,9 @@ def improve_text(text: str, mode: str, model_name: str) -> str:
     )
     return resp.choices[0].message.content.strip()
 
-def make_docx_from_text(text: str, heading: str | None = None) -> bytes:
-    d = Document()
-    if heading:
-        d.add_heading(heading, level=1)
-    for para in text.split("\n"):
-        d.add_paragraph(para)
-    bio = io.BytesIO()
-    d.save(bio)
-    return bio.getvalue()
-
-# -----------------------------
-# Diff & ekte Track Changes (w:ins / w:del)
-# -----------------------------
+# =============================
+# Track Changes-generator (w:ins / w:del)
+# =============================
 TOKEN_RE = re.compile(r"\s+|\w+|[^\w\s]", re.UNICODE)
 
 def tokenize_keep_ws(s: str) -> List[str]:
@@ -208,20 +318,27 @@ def diff_tokens(a: List[str], b: List[str]) -> List[Tuple[str, str]]:
                 out.append(("+", i_txt))
     return out
 
+def make_docx_from_text(text: str, heading: str | None = None) -> bytes:
+    d = Document()
+    if heading:
+        d.add_heading(heading, level=1)
+    for para in text.split("\n"):
+        d.add_paragraph(para)
+    bio = io.BytesIO()
+    d.save(bio)
+    return bio.getvalue()
+
 def make_tracked_changes_docx(original_text: str, improved_text: str, author: str = "ChatGPT") -> bytes:
     """
-    Lager en .docx der endringer er merket som ekte revisjoner:
-    - Innsatt: <w:ins w:author="..." w:date="..." w:id="..."><w:r><w:t>...</w:t></w:r></w:ins>
-    - Slettet: <w:del w:author="..." w:date="..." w:id="..."><w:r><w:delText>...</w:delText></w:r></w:del>
-    Vi bygger XML for word/document.xml og pakker det inn i et base-docx fra python-docx.
+    Bygger et .docx med ekte revisjoner:
+    <w:ins>/<w:del> rundt endringer, slik at Word kan Godta/Avvise.
     """
-    # 1) Lag base DOCX for å få standard styles, props, sectPr osv.
+    # Base DOCX for standard styles/sectPr
     base_doc = Document()
     base_bio = io.BytesIO()
     base_doc.save(base_bio)
     base_bytes = base_bio.getvalue()
 
-    # 2) Hent eksisterende document.xml for å gjenbruke namespaces og sectPr
     with ZipFile(io.BytesIO(base_bytes), "r") as zin:
         orig_doc_xml = zin.read("word/document.xml")
 
@@ -234,7 +351,6 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
     sectPr = body.find(f"{{{W_NS}}}sectPr") if body is not None else None
     sectPr_clone = ET.fromstring(ET.tostring(sectPr)) if sectPr is not None else ET.Element(f"{{{W_NS}}}sectPr")
 
-    # 3) Bygg nytt document.xml med revisjonsmarkering
     new_root = ET.Element(f"{{{W_NS}}}document", nsmap=nsmap)
     new_body = ET.SubElement(new_root, f"{{{W_NS}}}body")
 
@@ -244,7 +360,6 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
     def _add_text_run(parent, text: str):
         r = ET.SubElement(parent, f"{{{W_NS}}}r")
         t = ET.SubElement(r, f"{{{W_NS}}}t")
-        # Bevar ledende/etterfølgende blank
         if text.startswith(" ") or text.endswith(" "):
             t.set(f"{{{XML_NS}}}space", "preserve")
         t.text = text
@@ -256,7 +371,6 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
             dt.set(f"{{{XML_NS}}}space", "preserve")
         dt.text = text
 
-    # Del i avsnitt (linjeskift)
     orig_lines = (original_text or "").split("\n")
     imp_lines = (improved_text or "").split("\n")
     max_len = max(len(orig_lines), len(imp_lines))
@@ -301,12 +415,9 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
                 rev_id += 1
                 _add_del_run(de, seg)
 
-    # Legg til seksjonsegenskaper (Word krever at body slutter med sectPr)
     new_body.append(sectPr_clone)
-
     new_xml = ET.tostring(new_root, xml_declaration=True, encoding="UTF-8", standalone="yes")
 
-    # 4) Pakk nytt word/document.xml inn i base DOCX
     out_bio = io.BytesIO()
     with ZipFile(io.BytesIO(base_bytes), "r") as zin, ZipFile(out_bio, "w") as zout:
         for item in zin.infolist():
@@ -317,9 +428,121 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
 
     return out_bio.getvalue()
 
-# -----------------------------
-# Action
-# -----------------------------
+# =============================
+# UI: input tekst / modellvalg
+# =============================
+tab1, tab2 = st.tabs(["📄 Word-fil (.docx)", "✍️ Lim inn tekst"])
+uploaded_text: str | None = None
+
+with tab1:
+    up = st.file_uploader("Last opp .docx", type=["docx"])
+    if up is not None:
+        try:
+            src_bytes = up.read()
+            doc = Document(io.BytesIO(src_bytes))
+            uploaded_text = "\n".join(p.text for p in doc.paragraphs)
+        except Exception as e:
+            st.error(f"Kunne ikke lese Word-filen: {e}")
+
+with tab2:
+    pasted = st.text_area("Lim inn tekst her", height=300, placeholder="Lim inn manus her …")
+    if pasted and not uploaded_text:
+        uploaded_text = pasted
+
+colA, colB = st.columns(2)
+with colA:
+    tone = st.selectbox(
+        "Tone/retning",
+        ["Nøytral faglig", "Mer konsis", "Mer formell", "For legfaglig publikum"],
+        help="Velg hvordan teksten skal forbedres.",
+    )
+with colB:
+    model_name = st.selectbox(
+        "Modell",
+        ["gpt-4o-mini", "gpt-4o"],
+        help="Mini er rimelig og rask; gpt-4o kan gi litt høyere kvalitet.",
+    )
+
+st.caption("Tips: Del store manus i seksjoner (Introduksjon, Metode, Resultater, osv.) for bedre kontroll.")
+
+# =============================
+# Ordliste-UI (lokal + Drive)
+# =============================
+with st.expander("📚 Ordliste (last opp, se, lagre)"):
+    drive_ok = drive_enabled()
+    if drive_ok:
+        st.success("Google Drive er konfigurert.")
+    else:
+        st.info("Google Drive er ikke konfigurert (legg inn GDRIVE_SERVICE_ACCOUNT_JSON og GDRIVE_FOLDER_ID i Secrets).")
+
+    default_name = st.text_input("Filnavn i Drive", value="ordliste02okt.csv", help="Bruker denne når du laster inn/lagrer mot Drive.")
+
+    # Last opp lokalt
+    uploaded_gloss = st.file_uploader("Last opp ordliste (CSV eller JSON)", type=["csv", "json"], key="gloss_uploader")
+    if uploaded_gloss:
+        try:
+            gloss = load_glossary_file(uploaded_gloss)
+            st.session_state["glossary"] = gloss
+            st.success(f"Lastet {len(gloss)} foretrukne termer fra opplastet fil.")
+        except Exception as e:
+            st.error(f"Kunne ikke lese ordlisten: {e}")
+
+    # Last inn fra Drive
+    cols = st.columns(2)
+    with cols[0]:
+        if st.button("📥 Last inn fra Drive", disabled=not drive_ok):
+            try:
+                g = load_glossary_from_drive(default_name)
+                if g is None:
+                    st.warning(f"Fant ikke '{default_name}' i Drive-mappen.")
+                else:
+                    st.session_state["glossary"] = g
+                    st.success(f"Lastet {len(g)} termer fra Drive.")
+            except Exception as e:
+                st.error(f"Feil ved lesing fra Drive: {e}")
+
+    # Lagre til Drive
+    with cols[1]:
+        if st.button("💾 Lagre til Drive", disabled=not drive_ok):
+            try:
+                gloss = st.session_state.get("glossary", {})
+                if not gloss:
+                    st.warning("Ingen ordliste i minnet å lagre. Last opp eller last inn først.")
+                else:
+                    save_glossary_to_drive(gloss, default_name)
+                    st.success(f"Lagret ordliste som '{default_name}' i Drive-mappen.")
+            except Exception as e:
+                st.error(f"Feil ved lagring til Drive: {e}")
+
+    # Vis gjeldende ordliste + lokal nedlasting
+    gloss = st.session_state.get("glossary", {})
+    if gloss:
+        st.write("**Gjeldende ordliste (utdrag):**")
+        preview_rows = []
+        for i, (pref, syns) in enumerate(gloss.items()):
+            if i >= 50:
+                preview_rows.append({"preferred": "…", "synonyms": "…"})
+                break
+            preview_rows.append({"preferred": pref, "synonyms": "; ".join(syns)})
+        st.table(preview_rows)
+
+        dcols = st.columns(2)
+        with dcols[0]:
+            data_csv = dump_glossary_csv(gloss)
+            st.download_button("⬇️ Last ned CSV", data=data_csv, file_name="ordliste.csv", mime="text/csv")
+        with dcols[1]:
+            data_json = dump_glossary_json(gloss)
+            st.download_button("⬇️ Last ned JSON", data=data_json, file_name="ordliste.json", mime="application/json")
+    else:
+        st.info("Ingen ordliste lastet enda. Du kan fortsette uten, eller laste opp/inn over.")
+
+# =============================
+# Kjøring
+# =============================
+use_glossary_in_prompt = st.checkbox("Gi modellen beskjed om å bruke ordlisten (anbefalt)", value=True,
+                                     help="Legger en kort instruks om prefererte termer inn i prompten.")
+author_tag = st.text_input("Forfatter-tag for Track Changes", value="ChatGPT", help="Vises i Word som forfatter av endringer.")
+
 run_btn = st.button(
     "⚙️ Forbedre språk og lag Ekte Track Changes",
     type="primary",
@@ -334,23 +557,37 @@ if run_btn:
         st.error("OPENAI_API_KEY mangler.")
         st.stop()
 
+    glossary = st.session_state.get("glossary", {})
+
+    glossary_note = None
+    if use_glossary_in_prompt and glossary:
+        # kort instruks til modellen
+        preferred_list = "\n".join(f"- {p}" for p in list(glossary.keys())[:100])
+        glossary_note = (
+            "Bruk følgende prefererte termer konsekvent; normaliser eventuelle synonymer/varianter til eksakt skrivemåte:\n"
+            f"{preferred_list}"
+        )
+
     with st.spinner("Forbedrer tekst …"):
         try:
-            improved = improve_text(uploaded_text, tone, model_name)
+            improved = improve_text(uploaded_text, mode=tone, model_name=model_name, glossary_note=glossary_note)
         except Exception as e:
             st.error(f"Feil fra modellen: {e}")
             st.stop()
 
-    # Ren forbedret DOCX
-    improved_docx = make_docx_from_text(improved, "Forbedret tekst")
+    # Deterministisk terminologi-normalisering uavhengig av modell
+    final_text = apply_glossary(improved, glossary) if glossary else improved
 
-    # Ekte Track Changes DOCX (fra ren tekstdiff)
+    # Ren forbedret DOCX
+    improved_docx = make_docx_from_text(final_text, "Forbedret tekst")
+
+    # Ekte Track Changes DOCX (diff original vs final)
     with st.spinner("Genererer ekte Track Changes …"):
         try:
             tracked_docx = make_tracked_changes_docx(
                 original_text=uploaded_text or "",
-                improved_text=improved or "",
-                author="ChatGPT",
+                improved_text=final_text or "",
+                author=author_tag or "ChatGPT",
             )
         except Exception as e:
             st.error(f"Klarte ikke å lage Track Changes-dokument: {e}")
@@ -359,7 +596,7 @@ if run_btn:
     st.success("Ferdig!")
 
     st.subheader("Forhåndsvisning (ren forbedret tekst)")
-    st.text_area("Forbedret tekst", improved, height=300)
+    st.text_area("Forbedret tekst", final_text, height=300)
 
     st.download_button(
         "💾 Last ned ren forbedret Word (.docx)",
@@ -379,7 +616,9 @@ if run_btn:
 st.markdown("---")
 st.markdown(
     textwrap.dedent("""
-    **Om Track Changes:** Vi genererer WordprocessingML direkte med `<w:ins>` og `<w:del>` rundt endringer.
-    Microsoft Word skal da kjenne igjen revisjoner slik at du kan trykke **Godta**/**Avvis**.
+    **Om ordlisten:** Du kan laste opp CSV/JSON lokalt eller jobbe direkte mot Google Drive.
+    CSV-format støtter enten én kolonne `preferred`, eller to kolonner `preferred,synonyms`
+    (der `synonyms` kan være semikolon- eller pipe-separert: `a; b|c`).
+    **Om Track Changes:** Dokumentet genereres med `<w:ins>`/`<w:del>` slik at Word kan Godta/Avvise endringer.
     """)
 )
