@@ -1,3 +1,5 @@
-streamlit>=1.36
-python-docx>=1.1.0
-openai>=1.40.0
+streamlit
+python-docx
+openai
+google-api-python-client
+google-auth
