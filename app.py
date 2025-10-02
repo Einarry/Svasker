@@ -115,9 +115,11 @@ if "system_prompt" not in st.session_state:
 # Google Drive-støtte (valgfritt)
 # =============================
 def drive_enabled() -> bool:
+    """Returnerer True hvis nødvendige secrets finnes."""
     return "GDRIVE_SERVICE_ACCOUNT_JSON" in st.secrets and "GDRIVE_FOLDER_ID" in st.secrets
 
 def _folder_id_from_secret() -> str:
+    """Aksepterer både ren ID og fulle URL-er i GDRIVE_FOLDER_ID."""
     raw = st.secrets["GDRIVE_FOLDER_ID"].strip()
     m = re.search(r"/folders/([a-zA-Z0-9_-]+)", raw)
     if m:
@@ -127,16 +129,52 @@ def _folder_id_from_secret() -> str:
         return m.group(1)
     return raw
 
-def drive_find_file(service, folder_id: str, name: str):
-    """Finn fil i mappe ved robust navnematch (case/whitespace-insensitiv)."""
+def _drive_service():
+    """
+    Bygger en Drive-klient med robust parsing av service-account JSON.
+    Fikser vanlige feil der private_key er limt inn med ekte linjeskift.
+    Bruker 'drive' scope for å støtte både lesing og skriving.
+    """
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+
+    raw = st.secrets["GDRIVE_SERVICE_ACCOUNT_JSON"]
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError:
+        # Reparér hvis private_key inneholder ekte linjeskift
+        m = re.search(r'"private_key"\s*:\s*"(.*?)"', raw, flags=re.DOTALL)
+        if not m:
+            raise
+        key_content = m.group(1)
+        fixed_key = key_content.replace("\r\n", "\\n").replace("\n", "\\n")
+        raw = raw[:m.start(1)] + fixed_key + raw[m.end(1):]
+        info = json.loads(raw)
+
+    scopes = ["https://www.googleapis.com/auth/drive"]  # les + skriv i delte mapper
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return build("drive", "v3", credentials=creds)
+
+def drive_list_files(service, folder_id: str, limit: int = 100) -> List[dict]:
+    """List inntil 'limit' filer i en mappe (diagnosehjelp)."""
+    resp = service.files().list(
+        q=f"'{folder_id}' in parents and trashed = false",
+        fields="files(id,name,mimeType)",
+        pageSize=limit
+    ).execute()
+    return resp.get("files", [])
+
+def drive_find_file(service, folder_id: str, name: str) -> dict | None:
+    """
+    Finn fil i mappe ved robust navnematch (case/whitespace-insensitiv).
+    Skanner alle sider (paginert). Returnerer dict med id, name, mimeType – eller None.
+    """
     def _norm(s: str) -> str:
-        # trim, normaliser whitespace og små bokstaver
         return re.sub(r"\s+", " ", s).strip().lower()
 
     target_norm = _norm(name)
-
-    # 1) List alt i mappen (paginert) og sammenlikn lokalt
     page_token = None
+
     while True:
         resp = service.files().list(
             q=f"'{folder_id}' in parents and trashed = false",
@@ -151,8 +189,8 @@ def drive_find_file(service, folder_id: str, name: str):
         if not page_token:
             break
 
-    # 2) Fallback: prøv et 'contains' på navnet uten filendelse
-    base = name.rsplit(".", 1)[0]
+    # Fallback: 'contains' søk på basename uten endelse
+    base = name.rsplit(".", 1)[0].replace("'", "\\'")
     resp = service.files().list(
         q=f"'{folder_id}' in parents and name contains '{base}' and trashed = false",
         fields="files(id, name, mimeType)",
@@ -161,7 +199,8 @@ def drive_find_file(service, folder_id: str, name: str):
     files = resp.get("files", [])
     return files[0] if files else None
 
-def drive_upload_bytes(service, folder_id: str, name: str, data: bytes, mime: str):
+def drive_upload_bytes(service, folder_id: str, name: str, data: bytes, mime: str) -> str:
+    """Laster opp (eller overskriver) en fil i mappen. Returnerer fileId."""
     from googleapiclient.http import MediaIoBaseUpload
     existing = drive_find_file(service, folder_id, name)
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
@@ -172,7 +211,21 @@ def drive_upload_bytes(service, folder_id: str, name: str, data: bytes, mime: st
     file = service.files().create(body=meta, media_body=media, fields="id").execute()
     return file["id"]
 
+def _drive_export_bytes(service, file_id: str, mime: str) -> bytes:
+    """
+    Eksporter Google Docs/Sheets/Slides til gitt MIME (f.eks. 'text/csv' for Sheets).
+    """
+    from googleapiclient.http import MediaIoBaseDownload
+    req = service.files().export_media(fileId=file_id, mimeType=mime)
+    bio = io.BytesIO()
+    downloader = MediaIoBaseDownload(bio, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return bio.getvalue()
+
 def drive_download_bytes(service, file_id: str) -> bytes:
+    """Last ned rå bytes for 'vanlige' filer (ikke Google-dokumenttyper)."""
     from googleapiclient.http import MediaIoBaseDownload
     req = service.files().get_media(fileId=file_id)
     bio = io.BytesIO()
@@ -182,30 +235,55 @@ def drive_download_bytes(service, file_id: str) -> bytes:
         _, done = downloader.next_chunk()
     return bio.getvalue()
 
-def save_glossary_to_drive(gloss: Dict[str, List[str]], filename="ordliste.csv"):
+def save_glossary_to_drive(gloss: Dict[str, List[str]], filename: str = "ordliste.csv") -> str:
+    """
+    Lagre ordliste-dict til Drive som CSV eller JSON (avhengig av filename).
+    Forutsetter at dump_glossary_csv/json finnes i appen.
+    Returnerer fileId.
+    """
     service = _drive_service()
     folder_id = _folder_id_from_secret()
-    data = dump_glossary_csv(gloss) if filename.lower().endswith(".csv") else dump_glossary_json(gloss)
-    mime = "text/csv" if filename.lower().endswith(".csv") else "application/json"
-    drive_upload_bytes(service, folder_id, filename, data, mime)
+    if filename.lower().endswith(".csv"):
+        data = dump_glossary_csv(gloss)
+        mime = "text/csv"
+    else:
+        data = dump_glossary_json(gloss)
+        mime = "application/json"
+    return drive_upload_bytes(service, folder_id, filename, data, mime)
 
-def load_glossary_from_drive(filename="ordliste.csv") -> Dict[str, List[str]] | None:
+def load_glossary_from_drive(filename: str = "ordliste.csv") -> Dict[str, List[str]] | None:
+    """
+    Les ordliste fra Drive (CSV/JSON). Støtter også Google Sheets (eksporterer til CSV).
+    Forutsetter at _parse_glossary_csv_text finnes i appen.
+    """
     service = _drive_service()
     folder_id = _folder_id_from_secret()
     f = drive_find_file(service, folder_id, filename)
     if not f:
         return None
-    data = drive_download_bytes(service, f["id"])
-    if filename.lower().endswith(".json"):
-        obj = json.loads(data.decode("utf-8"))
-        if isinstance(obj, list):
-            return {term: [] for term in obj}
-        elif isinstance(obj, dict):
-            return {k: list(v) if isinstance(v, (list, tuple)) else ([str(v)] if v else []) for k, v in obj.items()}
-        else:
-            raise ValueError("JSON må være liste eller objekt.")
-    text = data.decode("utf-8")
-    return _parse_glossary_csv_text(text)
+
+    mime = f.get("mimeType", "")
+    data: bytes
+
+    if mime == "application/vnd.google-apps.spreadsheet":
+        # Eksporter Google Sheets → CSV
+        data = _drive_export_bytes(service, f["id"], "text/csv")
+        text = data.decode("utf-8")
+        return _parse_glossary_csv_text(text)
+    else:
+        # Vanlig fil: last ned bytes
+        data = drive_download_bytes(service, f["id"])
+        if filename.lower().endswith(".json"):
+            obj = json.loads(data.decode("utf-8"))
+            if isinstance(obj, list):
+                return {term: [] for term in obj}
+            elif isinstance(obj, dict):
+                return {k: list(v) if isinstance(v, (list, tuple)) else ([str(v)] if v else []) for k, v in obj.items()}
+            else:
+                raise ValueError("JSON må være liste eller objekt.")
+        # CSV
+        text = data.decode("utf-8")
+        return _parse_glossary_csv_text(text)
 
 # =============================
 # Ordliste: parse/lagre + bruk
@@ -638,5 +716,6 @@ st.markdown(
     **Track Changes:** Dokumentet genereres med `<w:ins>`/`<w:del>` slik at Word kan Godta/Avvise endringer.
     """)
 )
+
 
 
