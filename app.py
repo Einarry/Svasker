@@ -15,7 +15,7 @@ import streamlit as st
 from docx import Document
 from openai import OpenAI
 import difflib
-from lxml import etree as ET  # følger via python-docx
+from lxml import etree as ET  # egen avhengighet
 
 # =============================
 # Build timestamp (UTC) + badge
@@ -115,11 +115,9 @@ if "system_prompt" not in st.session_state:
 # Google Drive-støtte (valgfritt)
 # =============================
 def drive_enabled() -> bool:
-    """Returnerer True hvis nødvendige secrets finnes."""
     return "GDRIVE_SERVICE_ACCOUNT_JSON" in st.secrets and "GDRIVE_FOLDER_ID" in st.secrets
 
 def _folder_id_from_secret() -> str:
-    """Aksepterer både ren ID og fulle URL-er i GDRIVE_FOLDER_ID."""
     raw = st.secrets["GDRIVE_FOLDER_ID"].strip()
     m = re.search(r"/folders/([a-zA-Z0-9_-]+)", raw)
     if m:
@@ -130,11 +128,6 @@ def _folder_id_from_secret() -> str:
     return raw
 
 def _drive_service():
-    """
-    Bygger en Drive-klient med robust parsing av service-account JSON.
-    Fikser vanlige feil der private_key er limt inn med ekte linjeskift.
-    Bruker 'drive' scope for å støtte både lesing og skriving.
-    """
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
 
@@ -142,7 +135,6 @@ def _drive_service():
     try:
         info = json.loads(raw)
     except json.JSONDecodeError:
-        # Reparér hvis private_key inneholder ekte linjeskift
         m = re.search(r'"private_key"\s*:\s*"(.*?)"', raw, flags=re.DOTALL)
         if not m:
             raise
@@ -151,12 +143,11 @@ def _drive_service():
         raw = raw[:m.start(1)] + fixed_key + raw[m.end(1):]
         info = json.loads(raw)
 
-    scopes = ["https://www.googleapis.com/auth/drive"]  # les + skriv i delte mapper
+    scopes = ["https://www.googleapis.com/auth/drive"]  # les + skriv
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return build("drive", "v3", credentials=creds)
 
 def drive_list_files(service, folder_id: str, limit: int = 100) -> List[dict]:
-    """List inntil 'limit' filer i en mappe (diagnosehjelp)."""
     resp = service.files().list(
         q=f"'{folder_id}' in parents and trashed = false",
         fields="files(id,name,mimeType)",
@@ -165,10 +156,6 @@ def drive_list_files(service, folder_id: str, limit: int = 100) -> List[dict]:
     return resp.get("files", [])
 
 def drive_find_file(service, folder_id: str, name: str) -> dict | None:
-    """
-    Finn fil i mappe ved robust navnematch (case/whitespace-insensitiv).
-    Skanner alle sider (paginert). Returnerer dict med id, name, mimeType – eller None.
-    """
     def _norm(s: str) -> str:
         return re.sub(r"\s+", " ", s).strip().lower()
 
@@ -189,7 +176,6 @@ def drive_find_file(service, folder_id: str, name: str) -> dict | None:
         if not page_token:
             break
 
-    # Fallback: 'contains' søk på basename uten endelse
     base = name.rsplit(".", 1)[0].replace("'", "\\'")
     resp = service.files().list(
         q=f"'{folder_id}' in parents and name contains '{base}' and trashed = false",
@@ -200,7 +186,6 @@ def drive_find_file(service, folder_id: str, name: str) -> dict | None:
     return files[0] if files else None
 
 def drive_upload_bytes(service, folder_id: str, name: str, data: bytes, mime: str) -> str:
-    """Laster opp (eller overskriver) en fil i mappen. Returnerer fileId."""
     from googleapiclient.http import MediaIoBaseUpload
     existing = drive_find_file(service, folder_id, name)
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
@@ -212,7 +197,6 @@ def drive_upload_bytes(service, folder_id: str, name: str, data: bytes, mime: st
     return file["id"]
 
 def _drive_export_bytes(service, file_id: str, mime: str) -> bytes:
-    """Eksporter Google Docs/Sheets/Slides til gitt MIME (f.eks. 'text/csv' for Sheets)."""
     from googleapiclient.http import MediaIoBaseDownload
     req = service.files().export_media(fileId=file_id, mimeType=mime)
     bio = io.BytesIO()
@@ -223,7 +207,6 @@ def _drive_export_bytes(service, file_id: str, mime: str) -> bytes:
     return bio.getvalue()
 
 def drive_download_bytes(service, file_id: str) -> bytes:
-    """Last ned rå bytes for 'vanlige' filer (ikke Google-dokumenttyper)."""
     from googleapiclient.http import MediaIoBaseDownload
     req = service.files().get_media(fileId=file_id)
     bio = io.BytesIO()
@@ -234,7 +217,6 @@ def drive_download_bytes(service, file_id: str) -> bytes:
     return bio.getvalue()
 
 def save_glossary_to_drive(gloss: Dict[str, List[str]], filename: str = "ordliste.csv") -> str:
-    """Lagre ordliste som CSV/JSON til Drive. Returnerer fileId."""
     service = _drive_service()
     folder_id = _folder_id_from_secret()
     if filename.lower().endswith(".csv"):
@@ -246,7 +228,6 @@ def save_glossary_to_drive(gloss: Dict[str, List[str]], filename: str = "ordlist
     return drive_upload_bytes(service, folder_id, filename, data, mime)
 
 def load_glossary_from_drive(filename: str = "ordliste.csv") -> Dict[str, List[str]] | None:
-    """Les ordliste fra Drive (CSV/JSON). Støtter også Google Sheets → CSV."""
     service = _drive_service()
     folder_id = _folder_id_from_secret()
     f = drive_find_file(service, folder_id, filename)
@@ -346,17 +327,40 @@ def _match_case(repl: str, src: str) -> str:
         return repl.capitalize()
     return repl
 
-def apply_glossary(text: str, glossary: Dict[str, List[str]]) -> str:
+def apply_glossary_with_report(text: str, glossary: Dict[str, List[str]]):
+    """
+    Erstatter synonymer med foretrukket term og returnerer (ny_tekst, rapport).
+    rapport = {
+      "total": int,
+      "by_preferred": {preferred: count, ...},
+      "pairs": [(before_str, after_str), ...]
+    }
+    """
     if not glossary:
-        return text
+        return text, {"total": 0, "by_preferred": {}, "pairs": []}
+
+    report = {"total": 0, "by_preferred": {}, "pairs": []}
     out = text
+
     for preferred, syns in glossary.items():
+        pref_norm = preferred.strip().lower()
+        def repl(m):
+            src = m.group(0)
+            dst = _match_case(preferred, src)
+            report["total"] += 1
+            report["by_preferred"][preferred] = report["by_preferred"].get(preferred, 0) + 1
+            report["pairs"].append((src, dst))
+            return dst
+
         for s in set(syns):
-            if not s or s.strip().lower() == preferred.strip().lower():
+            if not s:
+                continue
+            if s.strip().lower() == pref_norm:
                 continue
             pattern = re.compile(rf"\b{re.escape(s)}\b", flags=re.IGNORECASE)
-            out = pattern.sub(lambda m: _match_case(preferred, m.group(0)), out)
-    return out
+            out = pattern.sub(repl, out)
+
+    return out, report
 
 # =============================
 # Modeller & prompts
@@ -364,17 +368,12 @@ def apply_glossary(text: str, glossary: Dict[str, List[str]]) -> str:
 def improve_text(text: str, mode: str, model_name: str, glossary_note: str | None) -> str:
     if not client:
         raise RuntimeError("OPENAI_API_KEY mangler – kan ikke kalle modellen.")
-
     system_prompt = st.session_state["system_prompt"]
     goals_map: Dict[str, str] = st.session_state["goals"]
-    instr = goals_map.get(
-        mode,
-        list(goals_map.values())[0] if goals_map else DEFAULT_GOALS["Nøytral faglig"]
-    )
+    instr = goals_map.get(mode, list(goals_map.values())[0] if goals_map else DEFAULT_GOALS["Nøytral faglig"])
     if glossary_note:
         instr = instr + "\n\n" + glossary_note
 
-    # Merk: ingen 'temperature' i params
     params = {
         "model": model_name,
         "messages": [
@@ -382,12 +381,11 @@ def improve_text(text: str, mode: str, model_name: str, glossary_note: str | Non
             {"role": "user", "content": f"{instr}\n\nTekst:\n{text}"},
         ],
     }
-
     resp = client.chat.completions.create(**params)
     return resp.choices[0].message.content.strip()
 
 # =============================
-# Track Changes-generator (w:ins / w:del) + statistikk
+# Diff & Track Changes (to-pass, to forfattere)
 # =============================
 TOKEN_RE = re.compile(r"\s+|\w+|[^\w\s]", re.UNICODE)
 
@@ -429,12 +427,28 @@ def make_docx_from_text(text: str, heading: str | None = None) -> bytes:
     d.save(bio)
     return bio.getvalue()
 
-def make_tracked_changes_docx(original_text: str, improved_text: str, author: str = "ChatGPT") -> Tuple[bytes, int, int]:
+def make_tracked_changes_docx(
+    original_text: str,
+    improved_text: str,   # språk-pass resultat
+    final_text: str,      # etter ordliste-pass
+    author_lang: str = "ChatGPT",           # forfatter for språk-pass
+    author_gloss: str = "ChatGPT (ordliste)"  # forfatter for ordliste-pass
+) -> Tuple[bytes, int, int, int, int]:
     """
-    Bygger et .docx med ekte revisjoner og returnerer også statistikk:
-    - changes_count: antall endringer (innsettinger + slettinger)
-    - inserted_chars: totalt antall tegn i innsettingene (inkludert mellomrom/punktsetting)
+    Lager .docx med ekte <w:ins>/<w:del>.
+    Vi identifiserer ordliste-endringer som diff(improved_text -> final_text) og
+    språk-endringer som det som gjenstår når vi diff'er original -> final og ekskluderer ordliste-segmentene.
+
+    Returnerer: (docx_bytes, total_changes, total_inserted_chars, glossary_changes, glossary_inserted_chars)
     """
+
+    # Identifiser ordliste-innsettinger/slettinger (tekst-segmenter) fra pass 2
+    imp_tok = tokenize_keep_ws(improved_text or "")
+    fin_tok = tokenize_keep_ws(final_text or "")
+    gl_edits = diff_tokens(imp_tok, fin_tok)
+    gl_insert_set = set(seg.strip() for op, seg in gl_edits if op == "+")
+    gl_delete_set = set(seg.strip() for op, seg in gl_edits if op == "-")
+
     # Base DOCX for standard styles/sectPr
     base_doc = Document()
     base_bio = io.BytesIO()
@@ -460,8 +474,10 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
     rev_id = 1
 
     # Statistikk
-    changes_count = 0
-    inserted_chars = 0
+    total_changes = 0
+    total_inserted_chars = 0
+    glossary_changes = 0
+    glossary_inserted_chars = 0
 
     def _add_text_run(parent, text: str):
         r = ET.SubElement(parent, f"{{{W_NS}}}r")
@@ -477,13 +493,14 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
             dt.set(f"{{{XML_NS}}}space", "preserve")
         dt.text = text
 
+    # Diff original -> final for dokumentets samlede endringer
     orig_lines = (original_text or "").split("\n")
-    imp_lines = (improved_text or "").split("\n")
-    max_len = max(len(orig_lines), len(imp_lines))
+    fin_lines = (final_text or "").split("\n")
+    max_len = max(len(orig_lines), len(fin_lines))
 
     for i in range(max_len):
         a = orig_lines[i] if i < len(orig_lines) else ""
-        b = imp_lines[i] if i < len(imp_lines) else ""
+        b = fin_lines[i] if i < len(fin_lines) else ""
 
         p = ET.SubElement(new_body, f"{{{W_NS}}}p")
 
@@ -494,25 +511,42 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
         for op, seg in edits:
             if not seg:
                 continue
+            seg_norm = seg.strip()
+
             if op == "=":
                 _add_text_run(p, seg)
+
             elif op == "+":
-                ins = ET.SubElement(
+                # ordliste-innsetting?
+                is_gloss = seg_norm in gl_insert_set
+                author = author_gloss if is_gloss else author_lang
+
+                ins_el = ET.SubElement(
                     p, f"{{{W_NS}}}ins",
                     {f"{{{W_NS}}}author": author, f"{{{W_NS}}}date": now_iso, f"{{{W_NS}}}id": str(rev_id)}
                 )
                 rev_id += 1
-                changes_count += 1
-                inserted_chars += len(seg)
-                _add_text_run(ins, seg)
+                total_changes += 1
+                total_inserted_chars += len(seg)
+                if is_gloss:
+                    glossary_changes += 1
+                    glossary_inserted_chars += len(seg)
+                _add_text_run(ins_el, seg)
+
             elif op == "-":
-                de = ET.SubElement(
+                # ordliste-sletting?
+                is_gloss = seg_norm in gl_delete_set
+                author = author_gloss if is_gloss else author_lang
+
+                del_el = ET.SubElement(
                     p, f"{{{W_NS}}}del",
                     {f"{{{W_NS}}}author": author, f"{{{W_NS}}}date": now_iso, f"{{{W_NS}}}id": str(rev_id)}
                 )
                 rev_id += 1
-                changes_count += 1
-                _add_del_run(de, seg)
+                total_changes += 1
+                if is_gloss:
+                    glossary_changes += 1
+                _add_del_run(del_el, seg)
 
     new_body.append(sectPr_clone)
     new_xml = ET.tostring(new_root, xml_declaration=True, encoding="UTF-8", standalone="yes")
@@ -525,7 +559,7 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
                 data = new_xml
             zout.writestr(item, data)
 
-    return out_bio.getvalue(), changes_count, inserted_chars
+    return out_bio.getvalue(), total_changes, total_inserted_chars, glossary_changes, glossary_inserted_chars
 
 # =============================
 # UI: tekstinn og modellvalg
@@ -548,7 +582,7 @@ with tab2:
     if pasted and not uploaded_text:
         uploaded_text = pasted
 
-# Tone + modell (uten egendefinert felt)
+# Tone + modell
 tone_options = list(st.session_state["goals"].keys()) or list(DEFAULT_GOALS.keys())
 colA, colB = st.columns(2)
 with colA:
@@ -639,12 +673,20 @@ with st.expander("📚 Ordliste (last opp / Drive / lagre)"):
 # =============================
 # Kjøring
 # =============================
-use_glossary_in_prompt = st.checkbox("Gi modellen beskjed om å bruke ordlisten (anbefalt)", value=True,
-                                     help="Legger en kort instruks om prefererte termer inn i prompten.")
-author_tag = st.text_input("Forfatter-tag for Track Changes", value="ChatGPT",
-                           help="Vises i Word som forfatter av endringer.")
+use_glossary_in_prompt = st.checkbox(
+    "Gi modellen beskjed om å bruke ordlisten (anbefalt)", value=True,
+    help="Legger en kort instruks om prefererte termer inn i prompten."
+)
+author_tag = st.text_input(
+    "Forfatter-tag for språk-pass", value="ChatGPT",
+    help="Vises i Word som forfatter av språkendringer."
+)
+author_gloss = st.text_input(
+    "Forfatter-tag for ordliste-pass", value="ChatGPT (ordliste)",
+    help="Vises i Word som forfatter av ordliste-endringer."
+)
 
-# Plassholder for statistikk-panelet (vises etter prosessering)
+# Statistikkpanel
 stats_placeholder = st.empty()
 
 run_btn = st.button(
@@ -678,32 +720,49 @@ if run_btn:
             st.error(f"Feil fra modellen: {e}")
             st.stop()
 
-    final_text = apply_glossary(improved, glossary) if glossary else improved
+    # Ordliste-pass (deterministisk) + rapport
+    if glossary:
+        final_text, gloss_report = apply_glossary_with_report(improved, glossary)
+    else:
+        final_text, gloss_report = improved, {"total": 0, "by_preferred": {}, "pairs": []}
 
     improved_docx = make_docx_from_text(final_text, "Forbedret tekst")
 
     with st.spinner("Genererer ekte Track Changes …"):
         try:
-            tracked_docx, changes_count, inserted_chars = make_tracked_changes_docx(
+            tracked_docx, changes_count, inserted_chars, gl_changes, gl_inserted_chars = make_tracked_changes_docx(
                 original_text=uploaded_text or "",
-                improved_text=final_text or "",
-                author=author_tag or "ChatGPT",
+                improved_text=improved or "",
+                final_text=final_text or "",
+                author_lang=author_tag or "ChatGPT",
+                author_gloss=author_gloss or "ChatGPT (ordliste)",
             )
         except Exception as e:
             st.error(f"Klarte ikke å lage Track Changes-dokument: {e}")
-            tracked_docx, changes_count, inserted_chars = None, 0, 0
+            tracked_docx, changes_count, inserted_chars, gl_changes, gl_inserted_chars = None, 0, 0, 0, 0
 
     st.success("Ferdig!")
 
-    # === Statistikkvindu under knappen ===
+    # 📊 Statistikk
     with stats_placeholder.container():
         st.subheader("📊 Resultatstatistikk")
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
-            st.metric("Foreslåtte endringer (antall)", f"{changes_count:,}")
+            st.metric("Foreslåtte endringer (totalt)", f"{changes_count:,}")
         with c2:
-            st.metric("Tegn i innsatte forslag", f"{inserted_chars:,}")
-        st.caption("Tegn i innsatte forslag inkluderer mellomrom og tegnsetting. Si ifra hvis du heller vil se antall *ikke-blanke* tegn.")
+            st.metric("Tegn i innsatte forslag (totalt)", f"{inserted_chars:,}")
+        with c3:
+            st.metric("Ordlistendringer (antall)", f"{gl_changes:,}")
+        st.caption("Farger styres av Word → Review → Track Changes → Change Tracking Options → Insertions/Deletions = “By author”.")
+
+    # Detaljer om ordlistebruk (valgfritt)
+    with st.expander("🔍 Ordliste-bruk (detaljer)"):
+        st.write(f"Totalt ordliste-erstatninger: **{gloss_report['total']}**")
+        if gloss_report["by_preferred"]:
+            rows = [{"Preferert term": k, "Antall": v} for k, v in sorted(gloss_report["by_preferred"].items(), key=lambda x: (-x[1], x[0]))]
+            st.table(rows)
+        else:
+            st.caption("Ingen ordliste-endringer i denne teksten.")
 
     st.subheader("Forhåndsvisning (ren forbedret tekst)")
     st.text_area("Forbedret tekst", final_text, height=300)
@@ -726,10 +785,8 @@ if run_btn:
 st.markdown("---")
 st.markdown(
     textwrap.dedent("""
-    **Ordliste:** UI viser ikke innholdet for å spare plass. Du kan likevel laste opp, lagre til Drive,
-    og laste ned som CSV/JSON.  
-    **PROMPTS:** Du kan redigere både SYSTEM-prompten og GOALS-prompten for valgt tone. Endringer lagres i denne økten.  
-    **Track Changes:** Dokumentet genereres med `<w:ins>`/`<w:del>` slik at Word kan Godta/Avvise endringer.
+    **Merk farger:** Dokumentet setter forfatter på endringene fra hvert pass. Word viser farger **By author**.
+    For å få tydelig to farger (ofte rødt/blått), gå til **Review → Track Changes → Change Tracking Options** og velg
+    **Insertions/Deletions = “By author”**.
     """)
 )
-
