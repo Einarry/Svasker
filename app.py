@@ -212,9 +212,7 @@ def drive_upload_bytes(service, folder_id: str, name: str, data: bytes, mime: st
     return file["id"]
 
 def _drive_export_bytes(service, file_id: str, mime: str) -> bytes:
-    """
-    Eksporter Google Docs/Sheets/Slides til gitt MIME (f.eks. 'text/csv' for Sheets).
-    """
+    """Eksporter Google Docs/Sheets/Slides til gitt MIME (f.eks. 'text/csv' for Sheets)."""
     from googleapiclient.http import MediaIoBaseDownload
     req = service.files().export_media(fileId=file_id, mimeType=mime)
     bio = io.BytesIO()
@@ -236,11 +234,7 @@ def drive_download_bytes(service, file_id: str) -> bytes:
     return bio.getvalue()
 
 def save_glossary_to_drive(gloss: Dict[str, List[str]], filename: str = "ordliste.csv") -> str:
-    """
-    Lagre ordliste-dict til Drive som CSV eller JSON (avhengig av filename).
-    Forutsetter at dump_glossary_csv/json finnes i appen.
-    Returnerer fileId.
-    """
+    """Lagre ordliste som CSV/JSON til Drive. Returnerer fileId."""
     service = _drive_service()
     folder_id = _folder_id_from_secret()
     if filename.lower().endswith(".csv"):
@@ -252,10 +246,7 @@ def save_glossary_to_drive(gloss: Dict[str, List[str]], filename: str = "ordlist
     return drive_upload_bytes(service, folder_id, filename, data, mime)
 
 def load_glossary_from_drive(filename: str = "ordliste.csv") -> Dict[str, List[str]] | None:
-    """
-    Les ordliste fra Drive (CSV/JSON). Støtter også Google Sheets (eksporterer til CSV).
-    Forutsetter at _parse_glossary_csv_text finnes i appen.
-    """
+    """Les ordliste fra Drive (CSV/JSON). Støtter også Google Sheets → CSV."""
     service = _drive_service()
     folder_id = _folder_id_from_secret()
     f = drive_find_file(service, folder_id, filename)
@@ -263,15 +254,11 @@ def load_glossary_from_drive(filename: str = "ordliste.csv") -> Dict[str, List[s
         return None
 
     mime = f.get("mimeType", "")
-    data: bytes
-
     if mime == "application/vnd.google-apps.spreadsheet":
-        # Eksporter Google Sheets → CSV
         data = _drive_export_bytes(service, f["id"], "text/csv")
         text = data.decode("utf-8")
         return _parse_glossary_csv_text(text)
     else:
-        # Vanlig fil: last ned bytes
         data = drive_download_bytes(service, f["id"])
         if filename.lower().endswith(".json"):
             obj = json.loads(data.decode("utf-8"))
@@ -281,7 +268,6 @@ def load_glossary_from_drive(filename: str = "ordliste.csv") -> Dict[str, List[s
                 return {k: list(v) if isinstance(v, (list, tuple)) else ([str(v)] if v else []) for k, v in obj.items()}
             else:
                 raise ValueError("JSON må være liste eller objekt.")
-        # CSV
         text = data.decode("utf-8")
         return _parse_glossary_csv_text(text)
 
@@ -394,7 +380,7 @@ def improve_text(text: str, mode: str, model_name: str, glossary_note: str | Non
     return resp.choices[0].message.content.strip()
 
 # =============================
-# Track Changes-generator (w:ins / w:del)
+# Track Changes-generator (w:ins / w:del) + statistikk
 # =============================
 TOKEN_RE = re.compile(r"\s+|\w+|[^\w\s]", re.UNICODE)
 
@@ -436,7 +422,13 @@ def make_docx_from_text(text: str, heading: str | None = None) -> bytes:
     d.save(bio)
     return bio.getvalue()
 
-def make_tracked_changes_docx(original_text: str, improved_text: str, author: str = "ChatGPT") -> bytes:
+def make_tracked_changes_docx(original_text: str, improved_text: str, author: str = "ChatGPT") -> Tuple[bytes, int, int]:
+    """
+    Bygger et .docx med ekte revisjoner og returnerer også statistikk:
+    - changes_count: antall endringer (innsettinger + slettinger)
+    - inserted_chars: totalt antall tegn i innsettingene (inkludert mellomrom/punktsetting)
+    """
+    # Base DOCX for standard styles/sectPr
     base_doc = Document()
     base_bio = io.BytesIO()
     base_doc.save(base_bio)
@@ -459,6 +451,10 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
 
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     rev_id = 1
+
+    # Statistikk
+    changes_count = 0
+    inserted_chars = 0
 
     def _add_text_run(parent, text: str):
         r = ET.SubElement(parent, f"{{{W_NS}}}r")
@@ -499,6 +495,8 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
                     {f"{{{W_NS}}}author": author, f"{{{W_NS}}}date": now_iso, f"{{{W_NS}}}id": str(rev_id)}
                 )
                 rev_id += 1
+                changes_count += 1
+                inserted_chars += len(seg)
                 _add_text_run(ins, seg)
             elif op == "-":
                 de = ET.SubElement(
@@ -506,6 +504,7 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
                     {f"{{{W_NS}}}author": author, f"{{{W_NS}}}date": now_iso, f"{{{W_NS}}}id": str(rev_id)}
                 )
                 rev_id += 1
+                changes_count += 1
                 _add_del_run(de, seg)
 
     new_body.append(sectPr_clone)
@@ -518,7 +517,8 @@ def make_tracked_changes_docx(original_text: str, improved_text: str, author: st
             if item.filename == "word/document.xml":
                 data = new_xml
             zout.writestr(item, data)
-    return out_bio.getvalue()
+
+    return out_bio.getvalue(), changes_count, inserted_chars
 
 # =============================
 # UI: tekstinn og modellvalg
@@ -541,17 +541,13 @@ with tab2:
     if pasted and not uploaded_text:
         uploaded_text = pasted
 
-# Tone + modell
+# Tone + modell (uten egendefinert felt)
 tone_options = list(st.session_state["goals"].keys()) or list(DEFAULT_GOALS.keys())
 colA, colB = st.columns(2)
 with colA:
     tone = st.selectbox("Tone/retning", tone_options, help="Velg hvordan teksten skal forbedres.")
 with colB:
-    default_models = ["gpt-5", "gpt-5-mini", "gpt-4o", "gpt-4o-mini"]
-    model_name = st.selectbox("Modell", default_models, index=0)
-custom_model = st.text_input("Egendefinert modellnavn (valgfritt)", placeholder="f.eks. gpt-5-chat-latest")
-if custom_model.strip():
-    model_name = custom_model.strip()
+    model_name = st.selectbox("Modell", ["gpt-5", "gpt-5-mini", "gpt-4o", "gpt-4o-mini"], index=0)
 
 st.caption("Tips: Del store manus i seksjoner (Introduksjon, Metode, Resultater, osv.) for bedre kontroll.")
 
@@ -641,6 +637,9 @@ use_glossary_in_prompt = st.checkbox("Gi modellen beskjed om å bruke ordlisten 
 author_tag = st.text_input("Forfatter-tag for Track Changes", value="ChatGPT",
                            help="Vises i Word som forfatter av endringer.")
 
+# Plassholder for statistikk-panelet (vises etter prosessering)
+stats_placeholder = st.empty()
+
 run_btn = st.button(
     "⚙️ Forbedre språk og lag Ekte Track Changes",
     type="primary",
@@ -678,16 +677,26 @@ if run_btn:
 
     with st.spinner("Genererer ekte Track Changes …"):
         try:
-            tracked_docx = make_tracked_changes_docx(
+            tracked_docx, changes_count, inserted_chars = make_tracked_changes_docx(
                 original_text=uploaded_text or "",
                 improved_text=final_text or "",
                 author=author_tag or "ChatGPT",
             )
         except Exception as e:
             st.error(f"Klarte ikke å lage Track Changes-dokument: {e}")
-            tracked_docx = None
+            tracked_docx, changes_count, inserted_chars = None, 0, 0
 
     st.success("Ferdig!")
+
+    # === Statistikkvindu under knappen ===
+    with stats_placeholder.container():
+        st.subheader("📊 Resultatstatistikk")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("Foreslåtte endringer (antall)", f"{changes_count:,}")
+        with c2:
+            st.metric("Tegn i innsatte forslag", f"{inserted_chars:,}")
+        st.caption("Tegn i innsatte forslag inkluderer mellomrom og tegnsetting. Si ifra hvis du heller vil se antall *ikke-blanke* tegn.")
 
     st.subheader("Forhåndsvisning (ren forbedret tekst)")
     st.text_area("Forbedret tekst", final_text, height=300)
@@ -716,6 +725,3 @@ st.markdown(
     **Track Changes:** Dokumentet genereres med `<w:ins>`/`<w:del>` slik at Word kan Godta/Avvise endringer.
     """)
 )
-
-
-
