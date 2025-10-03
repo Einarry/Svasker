@@ -364,19 +364,26 @@ def apply_glossary(text: str, glossary: Dict[str, List[str]]) -> str:
 def improve_text(text: str, mode: str, model_name: str, glossary_note: str | None) -> str:
     if not client:
         raise RuntimeError("OPENAI_API_KEY mangler – kan ikke kalle modellen.")
+
     system_prompt = st.session_state["system_prompt"]
     goals_map: Dict[str, str] = st.session_state["goals"]
-    instr = goals_map.get(mode, list(goals_map.values())[0] if goals_map else DEFAULT_GOALS["Nøytral faglig"])
+    instr = goals_map.get(
+        mode,
+        list(goals_map.values())[0] if goals_map else DEFAULT_GOALS["Nøytral faglig"]
+    )
     if glossary_note:
         instr = instr + "\n\n" + glossary_note
-    resp = client.chat.completions.create(
-        model=model_name,
-        messages=[
+
+    # Merk: ingen 'temperature' i params
+    params = {
+        "model": model_name,
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"{instr}\n\nTekst:\n{text}"},
         ],
-        temperature=0.2,
-    )
+    }
+
+    resp = client.chat.completions.create(**params)
     return resp.choices[0].message.content.strip()
 
 # =============================
@@ -725,3 +732,4 @@ st.markdown(
     **Track Changes:** Dokumentet genereres med `<w:ins>`/`<w:del>` slik at Word kan Godta/Avvise endringer.
     """)
 )
+
