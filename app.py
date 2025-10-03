@@ -105,7 +105,6 @@ DEFAULT_SYSTEM_PROMPT = (
     "Ikke endre referanseformatering."
 )
 
-# Legg i session_state hvis ikke finnes fra før
 if "goals" not in st.session_state:
     st.session_state["goals"] = DEFAULT_GOALS.copy()
 if "system_prompt" not in st.session_state:
@@ -158,10 +157,8 @@ def drive_list_files(service, folder_id: str, limit: int = 100) -> List[dict]:
 def drive_find_file(service, folder_id: str, name: str) -> dict | None:
     def _norm(s: str) -> str:
         return re.sub(r"\s+", " ", s).strip().lower()
-
     target_norm = _norm(name)
     page_token = None
-
     while True:
         resp = service.files().list(
             q=f"'{folder_id}' in parents and trashed = false",
@@ -175,7 +172,6 @@ def drive_find_file(service, folder_id: str, name: str) -> dict | None:
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
-
     base = name.rsplit(".", 1)[0].replace("'", "\\'")
     resp = service.files().list(
         q=f"'{folder_id}' in parents and name contains '{base}' and trashed = false",
@@ -233,7 +229,6 @@ def load_glossary_from_drive(filename: str = "ordliste.csv") -> Dict[str, List[s
     f = drive_find_file(service, folder_id, filename)
     if not f:
         return None
-
     mime = f.get("mimeType", "")
     if mime == "application/vnd.google-apps.spreadsheet":
         data = _drive_export_bytes(service, f["id"], "text/csv")
@@ -328,20 +323,10 @@ def _match_case(repl: str, src: str) -> str:
     return repl
 
 def apply_glossary_with_report(text: str, glossary: Dict[str, List[str]]):
-    """
-    Erstatter synonymer med foretrukket term og returnerer (ny_tekst, rapport).
-    rapport = {
-      "total": int,
-      "by_preferred": {preferred: count, ...},
-      "pairs": [(before_str, after_str), ...]
-    }
-    """
     if not glossary:
         return text, {"total": 0, "by_preferred": {}, "pairs": []}
-
     report = {"total": 0, "by_preferred": {}, "pairs": []}
     out = text
-
     for preferred, syns in glossary.items():
         pref_norm = preferred.strip().lower()
         def repl(m):
@@ -351,7 +336,6 @@ def apply_glossary_with_report(text: str, glossary: Dict[str, List[str]]):
             report["by_preferred"][preferred] = report["by_preferred"].get(preferred, 0) + 1
             report["pairs"].append((src, dst))
             return dst
-
         for s in set(syns):
             if not s:
                 continue
@@ -359,20 +343,77 @@ def apply_glossary_with_report(text: str, glossary: Dict[str, List[str]]):
                 continue
             pattern = re.compile(rf"\b{re.escape(s)}\b", flags=re.IGNORECASE)
             out = pattern.sub(repl, out)
-
     return out, report
 
 # =============================
-# Modeller & prompts
+# Aggressivitetsbudsjett + modellkall
 # =============================
-def improve_text(text: str, mode: str, model_name: str, glossary_note: str | None) -> str:
+def budget_from_strength(text_len: int, strength: int) -> Tuple[int, int]:
+    """
+    Returner (max_changes, max_insert_chars) basert på tekstlengde og aggressivitet 1–5.
+    Skalerer lineært på tekstlengde.
+    """
+    per_1000 = {
+        1: (2, 3),    # (endringer, innsettingstegn*10) -> ca 0.3% (3 per 1000)
+        2: (5, 8),    # ~0.8%
+        3: (10, 15),  # ~1.5%
+        4: (20, 30),  # ~3.0%
+        5: (40, 60),  # ~6.0%
+    }[max(1, min(5, strength))]
+    per_1000_changes, per_1000_ins_chars = per_1000
+    scale = max(1, int(round(text_len / 1000.0)))
+    return per_1000_changes * scale, per_1000_ins_chars * scale
+
+def build_strength_instructions(level: int) -> str:
+    presets = {
+        1: ("Minimal", [
+            "Rett bare stavefeil, tegnsetting og klare grammatikkfeil.",
+            "IKKE omformuler ellers. Ikke slå sammen/splitte setninger.",
+            "Hvis setningen er akseptabel, la den stå uendret."
+        ]),
+        2: ("Forsiktig", [
+            "Små justeringer for klarhet/flyt. Unngå synonymbytter (med mindre ordlisten krever det).",
+            "Ikke endre struktur eller avsnittsrekkefølge."
+        ]),
+        3: ("Moderat", [
+            "Forbedre klarhet og konsishet. Fjern fyllord.",
+            "Behold avsnittslogikk uendret."
+        ]),
+        4: ("Tydelig", [
+            "Konsis omskriving per setning, moderat omstrukturering tillatt.",
+            "Bevar innhold/mening uendret."
+        ]),
+        5: ("Aggressiv", [
+            "Optimaliser stil og flyt fritt så lenge meningen bevares.",
+            "Moderat omstrukturering er ok."
+        ]),
+    }
+    name, rules = presets[level]
+    bullet = "\n".join(f"- {r}" for r in rules)
+    return f"Aggressivitetsnivå: {name}.\n{bullet}"
+
+def improve_text(text: str, tone: str, model_name: str, glossary_note: str | None,
+                 strength: int, max_changes: int, max_insert_chars: int, strict=False) -> str:
     if not client:
         raise RuntimeError("OPENAI_API_KEY mangler – kan ikke kalle modellen.")
     system_prompt = st.session_state["system_prompt"]
     goals_map: Dict[str, str] = st.session_state["goals"]
-    instr = goals_map.get(mode, list(goals_map.values())[0] if goals_map else DEFAULT_GOALS["Nøytral faglig"])
+    tone_goal = goals_map.get(tone, list(goals_map.values())[0] if goals_map else DEFAULT_GOALS["Nøytral faglig"])
+    strength_instr = build_strength_instructions(strength)
+
+    budget_text = (
+        f"**Endringsbudsjett:** Sikt mot ≤ {max_changes} totale endringer (innsettinger+slettinger) "
+        f"og ≤ {max_insert_chars} innsettingstegn totalt. Prioriter å rette feil med størst effekt først. "
+        f"Hvis du risikerer å overskride budsjettet, la setninger stå uendret."
+    )
+
+    if strict:
+        budget_text += "\n**Streng håndheving:** Du overskred budsjettet i forrige utkast. Produser en ny versjon som holder seg **innenfor** budsjettet. " \
+                       "Behold kun de mest viktige forbedringene (grammatikkfeil/tvetydighet)."
+
+    instr = tone_goal + "\n\n" + strength_instr + "\n\n" + budget_text
     if glossary_note:
-        instr = instr + "\n\n" + glossary_note
+        instr += "\n\n" + glossary_note
 
     params = {
         "model": model_name,
@@ -385,7 +426,7 @@ def improve_text(text: str, mode: str, model_name: str, glossary_note: str | Non
     return resp.choices[0].message.content.strip()
 
 # =============================
-# Diff & Track Changes (to-pass, to forfattere)
+# Diff & Track Changes (to-pass, to forfattere) + måling
 # =============================
 TOKEN_RE = re.compile(r"\s+|\w+|[^\w\s]", re.UNICODE)
 
@@ -417,6 +458,14 @@ def diff_tokens(a: List[str], b: List[str]) -> List[Tuple[str, str]]:
                 out.append(("+", i_txt))
     return out
 
+def estimate_changes(orig_text: str, new_text: str) -> Tuple[int, int]:
+    a = tokenize_keep_ws(orig_text or "")
+    b = tokenize_keep_ws(new_text or "")
+    ops = diff_tokens(a, b)
+    changes = sum(1 for op, _ in ops if op in {"+", "-"})
+    ins_chars = sum(len(seg) for op, seg in ops if op == "+")
+    return changes, ins_chars
+
 def make_docx_from_text(text: str, heading: str | None = None) -> bytes:
     d = Document()
     if heading:
@@ -431,25 +480,17 @@ def make_tracked_changes_docx(
     original_text: str,
     improved_text: str,   # språk-pass resultat
     final_text: str,      # etter ordliste-pass
-    author_lang: str = "ChatGPT",           # forfatter for språk-pass
-    author_gloss: str = "ChatGPT (ordliste)"  # forfatter for ordliste-pass
+    author_lang: str = "ChatGPT",            # forfatter for språk-pass
+    author_gloss: str = "ChatGPT (ordliste)" # forfatter for ordliste-pass
 ) -> Tuple[bytes, int, int, int, int]:
-    """
-    Lager .docx med ekte <w:ins>/<w:del>.
-    Vi identifiserer ordliste-endringer som diff(improved_text -> final_text) og
-    språk-endringer som det som gjenstår når vi diff'er original -> final og ekskluderer ordliste-segmentene.
-
-    Returnerer: (docx_bytes, total_changes, total_inserted_chars, glossary_changes, glossary_inserted_chars)
-    """
-
-    # Identifiser ordliste-innsettinger/slettinger (tekst-segmenter) fra pass 2
+    # Identifiser ordliste-endringer via diff(improved -> final)
     imp_tok = tokenize_keep_ws(improved_text or "")
     fin_tok = tokenize_keep_ws(final_text or "")
     gl_edits = diff_tokens(imp_tok, fin_tok)
     gl_insert_set = set(seg.strip() for op, seg in gl_edits if op == "+")
     gl_delete_set = set(seg.strip() for op, seg in gl_edits if op == "-")
 
-    # Base DOCX for standard styles/sectPr
+    # Base DOCX for styles/sectPr
     base_doc = Document()
     base_bio = io.BytesIO()
     base_doc.save(base_bio)
@@ -489,11 +530,11 @@ def make_tracked_changes_docx(
     def _add_del_run(parent, text: str):
         r = ET.SubElement(parent, f"{{{W_NS}}}r")
         dt = ET.SubElement(r, f"{{{W_NS}}}delText")
-        if text.startswith(" ") or text.endswith(" "):
+        if text.startswith(" ") or text.endswith(" ""):
             dt.set(f"{{{XML_NS}}}space", "preserve")
         dt.text = text
 
-    # Diff original -> final for dokumentets samlede endringer
+    # Diff original -> final
     orig_lines = (original_text or "").split("\n")
     fin_lines = (final_text or "").split("\n")
     max_len = max(len(orig_lines), len(fin_lines))
@@ -517,10 +558,8 @@ def make_tracked_changes_docx(
                 _add_text_run(p, seg)
 
             elif op == "+":
-                # ordliste-innsetting?
                 is_gloss = seg_norm in gl_insert_set
                 author = author_gloss if is_gloss else author_lang
-
                 ins_el = ET.SubElement(
                     p, f"{{{W_NS}}}ins",
                     {f"{{{W_NS}}}author": author, f"{{{W_NS}}}date": now_iso, f"{{{W_NS}}}id": str(rev_id)}
@@ -534,10 +573,8 @@ def make_tracked_changes_docx(
                 _add_text_run(ins_el, seg)
 
             elif op == "-":
-                # ordliste-sletting?
                 is_gloss = seg_norm in gl_delete_set
                 author = author_gloss if is_gloss else author_lang
-
                 del_el = ET.SubElement(
                     p, f"{{{W_NS}}}del",
                     {f"{{{W_NS}}}author": author, f"{{{W_NS}}}date": now_iso, f"{{{W_NS}}}id": str(rev_id)}
@@ -582,13 +619,18 @@ with tab2:
     if pasted and not uploaded_text:
         uploaded_text = pasted
 
-# Tone + modell
+# Tone + modell + aggressivitet
 tone_options = list(st.session_state["goals"].keys()) or list(DEFAULT_GOALS.keys())
 colA, colB = st.columns(2)
 with colA:
     tone = st.selectbox("Tone/retning", tone_options, help="Velg hvordan teksten skal forbedres.")
 with colB:
     model_name = st.selectbox("Modell", ["gpt-5", "gpt-5-mini", "gpt-4o", "gpt-4o-mini"], index=0)
+
+strength = st.slider(
+    "Aggressivitet (1=minimal, 5=aggressiv)", min_value=1, max_value=5, value=3,
+    help="Styrer hvor mange endringer som er ønsket. Appen beregner et budsjett og instruerer modellen."
+)
 
 st.caption("Tips: Del store manus i seksjoner (Introduksjon, Metode, Resultater, osv.) for bedre kontroll.")
 
@@ -677,16 +719,11 @@ use_glossary_in_prompt = st.checkbox(
     "Gi modellen beskjed om å bruke ordlisten (anbefalt)", value=True,
     help="Legger en kort instruks om prefererte termer inn i prompten."
 )
-author_tag = st.text_input(
-    "Forfatter-tag for språk-pass", value="ChatGPT",
-    help="Vises i Word som forfatter av språkendringer."
-)
-author_gloss = st.text_input(
-    "Forfatter-tag for ordliste-pass", value="ChatGPT (ordliste)",
-    help="Vises i Word som forfatter av ordliste-endringer."
-)
+author_lang = st.text_input("Forfatter-tag for språk-pass", value="ChatGPT",
+                            help="Vises i Word som forfatter av språkendringer.")
+author_gloss = st.text_input("Forfatter-tag for ordliste-pass", value="ChatGPT (ordliste)",
+                             help="Vises i Word som forfatter av ordliste-endringer.")
 
-# Statistikkpanel
 stats_placeholder = st.empty()
 
 run_btn = st.button(
@@ -713,14 +750,44 @@ if run_btn:
             f"{preferred_list}"
         )
 
-    with st.spinner("Forbedrer tekst …"):
+    # Budsjett fra aggressivitetsnivå
+    max_changes, max_ins_chars = budget_from_strength(len(uploaded_text or ""), strength)
+
+    # Pass 1: språk-forbedring (med budsjett)
+    with st.spinner("Forbedrer tekst (språk-pass) …"):
         try:
-            improved = improve_text(uploaded_text, mode=tone, model_name=model_name, glossary_note=glossary_note)
+            improved = improve_text(
+                text=uploaded_text, tone=tone, model_name=model_name, glossary_note=glossary_note,
+                strength=strength, max_changes=max_changes, max_insert_chars=max_ins_chars, strict=False
+            )
         except Exception as e:
             st.error(f"Feil fra modellen: {e}")
             st.stop()
 
-    # Ordliste-pass (deterministisk) + rapport
+    # Estimér mot budsjett
+    est_changes, est_ins_chars = estimate_changes(uploaded_text or "", improved or "")
+    exceeded = (est_changes > max_changes) or (est_ins_chars > max_ins_chars)
+
+    # Streng re-run hvis budsjett overskredet
+    if exceeded:
+        with st.spinner("Strammer inn til budsjettet …"):
+            try:
+                improved_strict = improve_text(
+                    text=uploaded_text, tone=tone, model_name=model_name, glossary_note=glossary_note,
+                    strength=strength, max_changes=max_changes, max_insert_chars=max_ins_chars, strict=True
+                )
+                # mål på nytt, og ta den som nærmest budsjett
+                ch1, ins1 = est_changes, est_ins_chars
+                ch2, ins2 = estimate_changes(uploaded_text or "", improved_strict or "")
+                # velg det utkastet som ikke overskrider budsjett, ellers det med færrest endringer
+                if (ch2 <= max_changes and ins2 <= max_ins_chars) or (ch2 + ins2 < ch1 + ins1):
+                    improved = improved_strict
+                    est_changes, est_ins_chars = ch2, ins2
+                    exceeded = (est_changes > max_changes) or (est_ins_chars > max_ins_chars)
+            except Exception as e:
+                st.warning(f"Klarte ikke å stramme inn automatisk: {e}")
+
+    # Pass 2: deterministisk ordliste-normalisering + rapport
     if glossary:
         final_text, gloss_report = apply_glossary_with_report(improved, glossary)
     else:
@@ -728,13 +795,14 @@ if run_btn:
 
     improved_docx = make_docx_from_text(final_text, "Forbedret tekst")
 
+    # Generer Track Changes (to forfattere)
     with st.spinner("Genererer ekte Track Changes …"):
         try:
             tracked_docx, changes_count, inserted_chars, gl_changes, gl_inserted_chars = make_tracked_changes_docx(
                 original_text=uploaded_text or "",
                 improved_text=improved or "",
                 final_text=final_text or "",
-                author_lang=author_tag or "ChatGPT",
+                author_lang=author_lang or "ChatGPT",
                 author_gloss=author_gloss or "ChatGPT (ordliste)",
             )
         except Exception as e:
@@ -753,7 +821,13 @@ if run_btn:
             st.metric("Tegn i innsatte forslag (totalt)", f"{inserted_chars:,}")
         with c3:
             st.metric("Ordlistendringer (antall)", f"{gl_changes:,}")
-        st.caption("Farger styres av Word → Review → Track Changes → Change Tracking Options → Insertions/Deletions = “By author”.")
+
+        st.markdown(
+            f"- **Budsjett (nivå {strength})**: ≤ **{max_changes}** endringer, ≤ **{max_ins_chars}** innsettingstegn\n"
+            f"- **Språk-pass estimerte endringer**: {est_changes:,} / {est_ins_chars:,} tegn "
+            + ("✅ innen budsjett" if not exceeded else "⚠️ over budsjett")
+        )
+        st.caption("Budsjettet styrer modellen via instruksjoner og en automatisk innstrammingsrunde ved behov.")
 
     # Detaljer om ordlistebruk (valgfritt)
     with st.expander("🔍 Ordliste-bruk (detaljer)"):
@@ -764,9 +838,7 @@ if run_btn:
         else:
             st.caption("Ingen ordliste-endringer i denne teksten.")
 
-    st.subheader("Forhåndsvisning (ren forbedret tekst)")
-    st.text_area("Forbedret tekst", final_text, height=300)
-
+    # Nedlasting (ingen forhåndsvisningstekst i UI som ønsket)
     st.download_button(
         "💾 Last ned ren forbedret Word (.docx)",
         data=improved_docx,
@@ -785,8 +857,8 @@ if run_btn:
 st.markdown("---")
 st.markdown(
     textwrap.dedent("""
-    **Merk farger:** Dokumentet setter forfatter på endringene fra hvert pass. Word viser farger **By author**.
-    For å få tydelig to farger (ofte rødt/blått), gå til **Review → Track Changes → Change Tracking Options** og velg
-    **Insertions/Deletions = “By author”**.
+    **Aggressivitet:** Slideren styrer et endringsbudsjett og klare regler i prompten. Appen måler resultatet
+    og prøver en strengere ny runde hvis budsjettet sprenges.  
+    **Farger i Word:** To forfattere (språk/ordliste) → to farger når Word står på “By author”.
     """)
 )
