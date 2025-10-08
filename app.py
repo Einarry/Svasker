@@ -686,7 +686,7 @@ colA, colB = st.columns(2)
 with colA:
     tone = st.selectbox("Tone/retning", tone_options, help="Velg hvordan teksten skal forbedres.")
 with colB:
-    model_name = st.selectbox("Modell", ["gpt-5", "gpt-5-mini", "gpt-4o", "gpt-4o-mini"], index=0)
+    model_name = st.selectbox("Modell", ["gpt-5", "gpt-5-mini", "gpt-4o", "gpt-4o-mini"], index=1)
 
 strength = st.slider(
     "Aggressivitet (1=minimal, 5=aggressiv)", min_value=1, max_value=5, value=3,
@@ -915,3 +915,4 @@ st.markdown(
     **Farger i Word:** To forfattere (språk/ordliste) → to farger når Word står på “By author”.
     """)
 )
+
