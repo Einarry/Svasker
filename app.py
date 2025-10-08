@@ -110,6 +110,13 @@ if "goals" not in st.session_state:
 if "system_prompt" not in st.session_state:
     st.session_state["system_prompt"] = DEFAULT_SYSTEM_PROMPT
 
+# Liten helper for trygg toast
+def _toast(msg: str, icon: str = "✅"):
+    try:
+        st.toast(msg, icon=icon)
+    except Exception:
+        st.info(msg)
+
 # =============================
 # Google Drive-støtte (valgfritt)
 # =============================
@@ -247,6 +254,31 @@ def load_glossary_from_drive(filename: str = "ordliste.csv") -> Dict[str, List[s
         text = data.decode("utf-8")
         return _parse_glossary_csv_text(text)
 
+# --- App-konfig i Drive (huske sist brukt ordliste-fil) ---
+CONFIG_FILENAME = ".sprakvasker_config.json"
+
+def _load_app_config_from_drive() -> dict | None:
+    if not drive_enabled():
+        return None
+    try:
+        service = _drive_service()
+        folder_id = _folder_id_from_secret()
+        f = drive_find_file(service, folder_id, CONFIG_FILENAME)
+        if not f:
+            return None
+        data = drive_download_bytes(service, f["id"])
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        return None
+
+def _save_app_config_to_drive(conf: dict) -> None:
+    if not drive_enabled():
+        return
+    service = _drive_service()
+    folder_id = _folder_id_from_secret()
+    data = json.dumps(conf, ensure_ascii=False, indent=2).encode("utf-8")
+    drive_upload_bytes(service, folder_id, CONFIG_FILENAME, data, "application/json")
+
 # =============================
 # Ordliste: parse/lagre + bruk
 # =============================
@@ -323,10 +355,16 @@ def _match_case(repl: str, src: str) -> str:
     return repl
 
 def apply_glossary_with_report(text: str, glossary: Dict[str, List[str]]):
+    """
+    Erstatter synonymer med foretrukket term og returnerer (ny_tekst, rapport).
+    rapport = {"total": int, "by_preferred": {preferred: count, ...}, "pairs": [(src, dst), ...]}
+    """
     if not glossary:
         return text, {"total": 0, "by_preferred": {}, "pairs": []}
+
     report = {"total": 0, "by_preferred": {}, "pairs": []}
     out = text
+
     for preferred, syns in glossary.items():
         pref_norm = preferred.strip().lower()
         def repl(m):
@@ -336,6 +374,7 @@ def apply_glossary_with_report(text: str, glossary: Dict[str, List[str]]):
             report["by_preferred"][preferred] = report["by_preferred"].get(preferred, 0) + 1
             report["pairs"].append((src, dst))
             return dst
+
         for s in set(syns):
             if not s:
                 continue
@@ -343,6 +382,7 @@ def apply_glossary_with_report(text: str, glossary: Dict[str, List[str]]):
                 continue
             pattern = re.compile(rf"\b{re.escape(s)}\b", flags=re.IGNORECASE)
             out = pattern.sub(repl, out)
+
     return out, report
 
 # =============================
@@ -351,14 +391,13 @@ def apply_glossary_with_report(text: str, glossary: Dict[str, List[str]]):
 def budget_from_strength(text_len: int, strength: int) -> Tuple[int, int]:
     """
     Returner (max_changes, max_insert_chars) basert på tekstlengde og aggressivitet 1–5.
-    Skalerer lineært på tekstlengde.
     """
     per_1000 = {
-        1: (2, 3),    # (endringer, innsettingstegn*10) -> ca 0.3% (3 per 1000)
-        2: (5, 8),    # ~0.8%
-        3: (10, 15),  # ~1.5%
-        4: (20, 30),  # ~3.0%
-        5: (40, 60),  # ~6.0%
+        1: (2, 3),
+        2: (5, 8),
+        3: (10, 15),
+        4: (20, 30),
+        5: (40, 60),
     }[max(1, min(5, strength))]
     per_1000_changes, per_1000_ins_chars = per_1000
     scale = max(1, int(round(text_len / 1000.0)))
@@ -599,6 +638,28 @@ def make_tracked_changes_docx(
     return out_bio.getvalue(), total_changes, total_inserted_chars, glossary_changes, glossary_inserted_chars
 
 # =============================
+# Auto-last ordliste ved oppstart + husk sist brukte filnavn
+# =============================
+if "drive_glossary_filename" not in st.session_state:
+    # Prøv å hente sist brukt fra Drive-konfig
+    conf = _load_app_config_from_drive()
+    last_name = (conf or {}).get("glossary_filename")
+    st.session_state["drive_glossary_filename"] = last_name or "ordliste02okt.csv"
+
+# Autolast ordliste én gang per økt
+if drive_enabled() and "glossary_autoload_done" not in st.session_state:
+    try:
+        g = load_glossary_from_drive(st.session_state["drive_glossary_filename"])
+        if g:
+            st.session_state["glossary"] = g
+            st.session_state["glossary_autoload_done"] = True
+            _toast(f"Ordlisten «{st.session_state['drive_glossary_filename']}» ble lastet automatisk.")
+        else:
+            st.session_state["glossary_autoload_done"] = True
+    except Exception:
+        st.session_state["glossary_autoload_done"] = True
+
+# =============================
 # UI: tekstinn og modellvalg
 # =============================
 tab1, tab2 = st.tabs(["📄 Word-fil (.docx)", "✍️ Lim inn tekst"])
@@ -663,8 +724,11 @@ with st.expander("📚 Ordliste (last opp / Drive / lagre)"):
     st.info(("Google Drive er konfigurert." if drive_ok else
              "Google Drive er ikke konfigurert (legg inn GDRIVE_SERVICE_ACCOUNT_JSON og GDRIVE_FOLDER_ID i Secrets)."))
 
-    default_name = st.text_input("Filnavn i Drive", value="ordliste02okt.csv",
-                                 help="Brukes når du leser/lagrer mot Drive.")
+    default_name = st.text_input(
+        "Filnavn i Drive",
+        key="drive_glossary_filename",
+        help="Brukes når du leser/lagrer mot Drive."
+    )
 
     uploaded_gloss = st.file_uploader("Last opp ordliste (CSV/JSON)", type=["csv", "json"], key="gloss_uploader")
     if uploaded_gloss:
@@ -679,11 +743,12 @@ with st.expander("📚 Ordliste (last opp / Drive / lagre)"):
     with c1:
         if st.button("📥 Last inn fra Drive", disabled=not drive_ok):
             try:
-                g = load_glossary_from_drive(default_name)
+                g = load_glossary_from_drive(st.session_state["drive_glossary_filename"])
                 if g is None:
-                    st.warning(f"Fant ikke «{default_name}» i Drive-mappen.")
+                    st.warning(f"Fant ikke «{st.session_state['drive_glossary_filename']}» i Drive-mappen.")
                 else:
                     st.session_state["glossary"] = g
+                    _save_app_config_to_drive({"glossary_filename": st.session_state["drive_glossary_filename"]})
                     st.success(f"Ordlistestatus: {len(g)} termer lastet fra Drive.")
             except Exception as e:
                 st.error(f"Feil ved lesing fra Drive: {e}")
@@ -695,8 +760,9 @@ with st.expander("📚 Ordliste (last opp / Drive / lagre)"):
                 if not gloss:
                     st.warning("Ingen ordliste i minnet å lagre. Last opp eller last inn først.")
                 else:
-                    save_glossary_to_drive(gloss, default_name)
-                    st.success(f"Lagret ordliste som «{default_name}» i Drive-mappen.")
+                    save_glossary_to_drive(gloss, st.session_state["drive_glossary_filename"])
+                    _save_app_config_to_drive({"glossary_filename": st.session_state["drive_glossary_filename"]})
+                    st.success(f"Lagret ordliste som «{st.session_state['drive_glossary_filename']}» i Drive-mappen.")
             except Exception as e:
                 st.error(f"Feil ved lagring til Drive: {e}")
 
@@ -762,7 +828,7 @@ if run_btn:
             st.error(f"Feil fra modellen: {e}")
             st.stop()
 
-    # Estimér mot budsjett
+    # Estimer mot budsjett
     est_changes, est_ins_chars = estimate_changes(uploaded_text or "", improved or "")
     exceeded = (est_changes > max_changes) or (est_ins_chars > max_ins_chars)
 
@@ -774,10 +840,8 @@ if run_btn:
                     text=uploaded_text, tone=tone, model_name=model_name, glossary_note=glossary_note,
                     strength=strength, max_changes=max_changes, max_insert_chars=max_ins_chars, strict=True
                 )
-                # mål på nytt, og ta den som nærmest budsjett
                 ch1, ins1 = est_changes, est_ins_chars
                 ch2, ins2 = estimate_changes(uploaded_text or "", improved_strict or "")
-                # velg det utkastet som ikke overskrider budsjett, ellers det med færrest endringer
                 if (ch2 <= max_changes and ins2 <= max_ins_chars) or (ch2 + ins2 < ch1 + ins1):
                     improved = improved_strict
                     est_changes, est_ins_chars = ch2, ins2
@@ -827,16 +891,7 @@ if run_btn:
         )
         st.caption("Budsjettet styrer modellen via instruksjoner og en automatisk innstrammingsrunde ved behov.")
 
-    # Detaljer om ordlistebruk (valgfritt)
-    with st.expander("🔍 Ordliste-bruk (detaljer)"):
-        st.write(f"Totalt ordliste-erstatninger: **{gloss_report['total']}**")
-        if gloss_report["by_preferred"]:
-            rows = [{"Preferert term": k, "Antall": v} for k, v in sorted(gloss_report["by_preferred"].items(), key=lambda x: (-x[1], x[0]))]
-            st.table(rows)
-        else:
-            st.caption("Ingen ordliste-endringer i denne teksten.")
-
-    # Nedlasting (ingen forhåndsvisningstekst i UI som ønsket)
+    # Nedlasting (ingen forhåndsvisningstekst i UI)
     st.download_button(
         "💾 Last ned ren forbedret Word (.docx)",
         data=improved_docx,
@@ -860,5 +915,3 @@ st.markdown(
     **Farger i Word:** To forfattere (språk/ordliste) → to farger når Word står på “By author”.
     """)
 )
-
-
