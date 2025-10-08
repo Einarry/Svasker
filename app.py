@@ -530,7 +530,7 @@ def make_tracked_changes_docx(
     def _add_del_run(parent, text: str):
         r = ET.SubElement(parent, f"{{{W_NS}}}r")
         dt = ET.SubElement(r, f"{{{W_NS}}}delText")
-        if text.startswith(" ") or text.endswith(" ""):
+        if text.startswith(" ") or text.endswith(" "):
             dt.set(f"{{{XML_NS}}}space", "preserve")
         dt.text = text
 
@@ -862,3 +862,4 @@ st.markdown(
     **Farger i Word:** To forfattere (språk/ordliste) → to farger når Word står på “By author”.
     """)
 )
+
