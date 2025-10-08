@@ -632,8 +632,6 @@ strength = st.slider(
     help="Styrer hvor mange endringer som er ønsket. Appen beregner et budsjett og instruerer modellen."
 )
 
-st.caption("Tips: Del store manus i seksjoner (Introduksjon, Metode, Resultater, osv.) for bedre kontroll.")
-
 # =============================
 # ✏️ Rediger PROMPTS (SYSTEM + GOALS for valgt tone)
 # =============================
@@ -862,4 +860,5 @@ st.markdown(
     **Farger i Word:** To forfattere (språk/ordliste) → to farger når Word står på “By author”.
     """)
 )
+
 
