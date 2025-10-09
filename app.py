@@ -12,10 +12,10 @@ from typing import Dict, List, Tuple
 from zipfile import ZipFile
 
 import streamlit as st
-from docx import Document
 from openai import OpenAI
 import difflib
-from lxml import etree as ET  # egen avhengighet
+from lxml import etree as ET  # må stå i requirements
+from docx import Document     # kun brukt til "ren forbedret" (valgfritt)
 
 # =============================
 # Build timestamp (UTC) + badge
@@ -110,7 +110,6 @@ if "goals" not in st.session_state:
 if "system_prompt" not in st.session_state:
     st.session_state["system_prompt"] = DEFAULT_SYSTEM_PROMPT
 
-# Liten helper for trygg toast
 def _toast(msg: str, icon: str = "✅"):
     try:
         st.toast(msg, icon=icon)
@@ -152,14 +151,6 @@ def _drive_service():
     scopes = ["https://www.googleapis.com/auth/drive"]  # les + skriv
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return build("drive", "v3", credentials=creds)
-
-def drive_list_files(service, folder_id: str, limit: int = 100) -> List[dict]:
-    resp = service.files().list(
-        q=f"'{folder_id}' in parents and trashed = false",
-        fields="files(id,name,mimeType)",
-        pageSize=limit
-    ).execute()
-    return resp.get("files", [])
 
 def drive_find_file(service, folder_id: str, name: str) -> dict | None:
     def _norm(s: str) -> str:
@@ -390,7 +381,7 @@ def apply_glossary_with_report(text: str, glossary: Dict[str, List[str]]):
 # =============================
 def budget_from_strength(text_len: int, strength: int) -> Tuple[int, int]:
     """
-    Returner (max_changes, max_insert_chars) basert på tekstlengde og aggressivitet 1–5.
+    Returner (max_changes, max_insert_chars) basert på tekstlengde og aggressivitet 1–5 (per avsnitt).
     """
     per_1000 = {
         1: (2, 3),
@@ -400,7 +391,7 @@ def budget_from_strength(text_len: int, strength: int) -> Tuple[int, int]:
         5: (40, 60),
     }[max(1, min(5, strength))]
     per_1000_changes, per_1000_ins_chars = per_1000
-    scale = max(1, int(round(text_len / 1000.0)))
+    scale = max(1, int(round(max(1, text_len) / 1000.0)))
     return per_1000_changes * scale, per_1000_ins_chars * scale
 
 def build_strength_instructions(level: int) -> str:
@@ -465,12 +456,12 @@ def improve_text(text: str, tone: str, model_name: str, glossary_note: str | Non
     return resp.choices[0].message.content.strip()
 
 # =============================
-# Diff & Track Changes (to-pass, to forfattere) + måling
+# Diff & Track Changes utils
 # =============================
 TOKEN_RE = re.compile(r"\s+|\w+|[^\w\s]", re.UNICODE)
 
 def tokenize_keep_ws(s: str) -> List[str]:
-    return TOKEN_RE.findall(s)
+    return TOKEN_RE.findall(s or "")
 
 def diff_tokens(a: List[str], b: List[str]) -> List[Tuple[str, str]]:
     sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
@@ -497,156 +488,287 @@ def diff_tokens(a: List[str], b: List[str]) -> List[Tuple[str, str]]:
                 out.append(("+", i_txt))
     return out
 
-def estimate_changes(orig_text: str, new_text: str) -> Tuple[int, int]:
-    a = tokenize_keep_ws(orig_text or "")
-    b = tokenize_keep_ws(new_text or "")
-    ops = diff_tokens(a, b)
-    changes = sum(1 for op, _ in ops if op in {"+", "-"})
-    ins_chars = sum(len(seg) for op, seg in ops if op == "+")
-    return changes, ins_chars
+def paragraph_text(p_el, W_NS: str) -> str:
+    """Hent ren tekst fra et <w:p>-element (slår sammen alle w:t)."""
+    texts = []
+    for t in p_el.findall(f".//{{{W_NS}}}t"):
+        texts.append(t.text or "")
+    return "".join(texts)
 
-def make_docx_from_text(text: str, heading: str | None = None) -> bytes:
-    d = Document()
-    if heading:
-        d.add_heading(heading, level=1)
-    for para in text.split("\n"):
-        d.add_paragraph(para)
-    bio = io.BytesIO()
-    d.save(bio)
-    return bio.getvalue()
+def clear_paragraph_content_keep_pPr(p_el, W_NS: str):
+    """Fjerner alt i <w:p> unntatt <w:pPr> (beholder avsnittsstil/nummer)."""
+    to_remove = []
+    pPr = None
+    for child in list(p_el):
+        if child.tag == f"{{{W_NS}}}pPr":
+            pPr = child
+        else:
+            to_remove.append(child)
+    for c in to_remove:
+        p_el.remove(c)
+    if pPr is not None:
+        # sikre at pPr ligger først
+        if list(p_el) and list(p_el)[0] is not pPr:
+            p_el.remove(pPr)
+            p_el.insert(0, pPr)
 
-def make_tracked_changes_docx(
-    original_text: str,
-    improved_text: str,   # språk-pass resultat
-    final_text: str,      # etter ordliste-pass
-    author_lang: str = "ChatGPT",            # forfatter for språk-pass
-    author_gloss: str = "ChatGPT (ordliste)" # forfatter for ordliste-pass
-) -> Tuple[bytes, int, int, int, int]:
-    # Identifiser ordliste-endringer via diff(improved -> final)
-    imp_tok = tokenize_keep_ws(improved_text or "")
-    fin_tok = tokenize_keep_ws(final_text or "")
-    gl_edits = diff_tokens(imp_tok, fin_tok)
-    gl_insert_set = set(seg.strip() for op, seg in gl_edits if op == "+")
-    gl_delete_set = set(seg.strip() for op, seg in gl_edits if op == "-")
+def add_text_run(parent, W_NS: str, XML_NS: str, text: str):
+    r = ET.SubElement(parent, f"{{{W_NS}}}r")
+    t = ET.SubElement(r, f"{{{W_NS}}}t")
+    if text.startswith(" ") or text.endswith(" "):
+        t.set(f"{{{XML_NS}}}space", "preserve")
+    # håndter linjeskift: erstatte '\n' med <w:br/>
+    parts = text.split("\n")
+    if len(parts) == 1:
+        t.text = text
+    else:
+        # Første del i denne <w:t>
+        t.text = parts[0]
+        for part in parts[1:]:
+            ET.SubElement(r, f"{{{W_NS}}}br")
+            t2 = ET.SubElement(r, f"{{{W_NS}}}t")
+            if part.startswith(" ") or part.endswith(" "):
+                t2.set(f"{{{XML_NS}}}space", "preserve")
+            t2.text = part
 
-    # Base DOCX for styles/sectPr
-    base_doc = Document()
-    base_bio = io.BytesIO()
-    base_doc.save(base_bio)
-    base_bytes = base_bio.getvalue()
+def add_del_run(parent, W_NS: str, XML_NS: str, text: str):
+    r = ET.SubElement(parent, f"{{{W_NS}}}r")
+    dt = ET.SubElement(r, f"{{{W_NS}}}delText")
+    if text.startswith(" ") or text.endswith(" "):
+        dt.set(f"{{{XML_NS}}}space", "preserve")
+    parts = text.split("\n")
+    if len(parts) == 1:
+        dt.text = text
+    else:
+        # delText støtter ikke br direkte, men vi kan bare sette '\n' inn – Word viser del-sone på linjen.
+        dt.text = text
 
-    with ZipFile(io.BytesIO(base_bytes), "r") as zin:
-        orig_doc_xml = zin.read("word/document.xml")
+def rewrite_paragraph_with_track_changes(
+    p_el,
+    orig_text: str,
+    improved_text: str,
+    final_text: str,
+    authors: Tuple[str, str],
+    W_NS: str,
+    XML_NS: str,
+    now_iso: str,
+    start_rev_id: int
+) -> Tuple[int, int, int, int]:
+    """
+    Skriver inn track changes i det opprinnelige <w:p>-elementet.
+    Returnerer (ny_rev_id, total_changes, total_insert_chars, glossary_changes)
+    """
+    author_lang, author_gloss = authors
 
-    root = ET.fromstring(orig_doc_xml)
+    # Identifiser ordliste-endringer (improved -> final)
+    imp_ops = diff_tokens(tokenize_keep_ws(improved_text), tokenize_keep_ws(final_text))
+    gl_ins = set(seg.strip() for op, seg in imp_ops if op == "+")
+    gl_del = set(seg.strip() for op, seg in imp_ops if op == "-")
+
+    # Diff original -> final
+    ops = diff_tokens(tokenize_keep_ws(orig_text), tokenize_keep_ws(final_text))
+
+    # Tøm innhold (behold pPr)
+    clear_paragraph_content_keep_pPr(p_el, W_NS)
+
+    rev_id = start_rev_id
+    total_changes = 0
+    total_insert_chars = 0
+    glossary_changes = 0
+
+    for op, seg in ops:
+        if not seg:
+            continue
+        seg_norm = seg.strip()
+
+        if op == "=":
+            add_text_run(p_el, W_NS, XML_NS, seg)
+
+        elif op == "+":
+            is_gloss = seg_norm in gl_ins
+            author = author_gloss if is_gloss else author_lang
+            ins_el = ET.SubElement(
+                p_el, f"{{{W_NS}}}ins",
+                {f"{{{W_NS}}}author": author, f"{{{W_NS}}}date": now_iso, f"{{{W_NS}}}id": str(rev_id)}
+            )
+            rev_id += 1
+            total_changes += 1
+            total_insert_chars += len(seg)
+            if is_gloss:
+                glossary_changes += 1
+            add_text_run(ins_el, W_NS, XML_NS, seg)
+
+        elif op == "-":
+            is_gloss = seg_norm in gl_del
+            author = author_gloss if is_gloss else author_lang
+            del_el = ET.SubElement(
+                p_el, f"{{{W_NS}}}del",
+                {f"{{{W_NS}}}author": author, f"{{{W_NS}}}date": now_iso, f"{{{W_NS}}}id": str(rev_id)}
+            )
+            rev_id += 1
+            total_changes += 1
+            if is_gloss:
+                glossary_changes += 1
+            add_del_run(del_el, W_NS, XML_NS, seg)
+
+    return rev_id, total_changes, total_insert_chars, glossary_changes
+
+# =============================
+# Per-avsnitt prosess (Valg B)
+# =============================
+def process_docx_with_track_changes(
+    src_docx_bytes: bytes,
+    tone: str,
+    model_name: str,
+    glossary: Dict[str, List[str]],
+    include_gloss_in_prompt: bool,
+    strength: int,
+    author_lang: str,
+    author_gloss: str,
+) -> Tuple[bytes, bytes, Dict[str, int], Dict[str, int]]:
+    """
+    Åpner original .docx og skriver endringer inn i samme document.xml.
+    Returnerer (tracked_docx_bytes, clean_docx_bytes, totals, gloss_totals)
+    totals: {"changes": int, "insert_chars": int}
+    gloss_totals: {"changes": int, "insert_chars": int}
+    """
+    # For prompt: liste kun de første 100 prefererte
+    glossary_note = None
+    if include_gloss_in_prompt and glossary:
+        preferred_list = "\n".join(f"- {p}" for p in list(glossary.keys())[:100])
+        glossary_note = (
+            "Bruk følgende prefererte termer konsekvent; normaliser eventuelle synonymer/varianter til eksakt skrivemåte:\n"
+            f"{preferred_list}"
+        )
+
+    # Pakk ut original document.xml
+    zin = ZipFile(io.BytesIO(src_docx_bytes), "r")
+    doc_xml = zin.read("word/document.xml")
+    root = ET.fromstring(doc_xml)
+
+    # Namespaces
     nsmap = root.nsmap.copy()
     W_NS = nsmap.get("w", "http://schemas.openxmlformats.org/wordprocessingml/2006/main")
     XML_NS = "http://www.w3.org/XML/1998/namespace"
 
-    body = root.find(f"{{{W_NS}}}body")
-    sectPr = body.find(f"{{{W_NS}}}sectPr") if body is not None else None
-    sectPr_clone = ET.fromstring(ET.tostring(sectPr)) if sectPr is not None else ET.Element(f"{{{W_NS}}}sectPr")
-
-    new_root = ET.Element(f"{{{W_NS}}}document", nsmap=nsmap)
-    new_body = ET.SubElement(new_root, f"{{{W_NS}}}body")
+    # Finn alle <w:p> i dokumentet (inkluderer tabeller)
+    paragraphs = root.findall(f".//{{{W_NS}}}p")
 
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     rev_id = 1
 
-    # Statistikk
     total_changes = 0
-    total_inserted_chars = 0
-    glossary_changes = 0
-    glossary_inserted_chars = 0
+    total_insert_chars = 0
+    glossary_changes_total = 0
+    glossary_insert_chars_total = 0
 
-    def _add_text_run(parent, text: str):
-        r = ET.SubElement(parent, f"{{{W_NS}}}r")
-        t = ET.SubElement(r, f"{{{W_NS}}}t")
-        if text.startswith(" ") or text.endswith(" "):
-            t.set(f"{{{XML_NS}}}space", "preserve")
-        t.text = text
+    # For "ren forbedret"-variant: vi lager en kopiert XML der vi skriver inn endelig tekst uten track changes
+    clean_root = ET.fromstring(doc_xml)  # separat tre
 
-    def _add_del_run(parent, text: str):
-        r = ET.SubElement(parent, f"{{{W_NS}}}r")
-        dt = ET.SubElement(r, f"{{{W_NS}}}delText")
-        if text.startswith(" ") or text.endswith(" "):
-            dt.set(f"{{{XML_NS}}}space", "preserve")
-        dt.text = text
+    for p_idx, p in enumerate(paragraphs):
+        # Hent original tekst
+        orig = paragraph_text(p, W_NS)
+        if not orig.strip():
+            continue
 
-    # Diff original -> final
-    orig_lines = (original_text or "").split("\n")
-    fin_lines = (final_text or "").split("\n")
-    max_len = max(len(orig_lines), len(fin_lines))
+        # Budsjett per avsnitt
+        max_changes, max_ins_chars = budget_from_strength(len(orig), strength)
 
-    for i in range(max_len):
-        a = orig_lines[i] if i < len(orig_lines) else ""
-        b = fin_lines[i] if i < len(fin_lines) else ""
+        # Språk-pass (LLM), med ev. innstrammingsrunde
+        try:
+            improved = improve_text(
+                text=orig, tone=tone, model_name=model_name, glossary_note=glossary_note,
+                strength=strength, max_changes=max_changes, max_insert_chars=max_ins_chars, strict=False
+            )
+        except Exception as e:
+            # Hvis modellkallet feiler for ett avsnitt, fall tilbake til original
+            improved = orig
 
-        p = ET.SubElement(new_body, f"{{{W_NS}}}p")
+        # Estimering
+        a = tokenize_keep_ws(orig)
+        b = tokenize_keep_ws(improved)
+        ops_est = diff_tokens(a, b)
+        est_changes = sum(1 for op, _ in ops_est if op in {"+", "-"})
+        est_insert_chars = sum(len(seg) for op, seg in ops_est if op == "+")
 
-        a_tok = tokenize_keep_ws(a)
-        b_tok = tokenize_keep_ws(b)
-        edits = diff_tokens(a_tok, b_tok)
-
-        for op, seg in edits:
-            if not seg:
-                continue
-            seg_norm = seg.strip()
-
-            if op == "=":
-                _add_text_run(p, seg)
-
-            elif op == "+":
-                is_gloss = seg_norm in gl_insert_set
-                author = author_gloss if is_gloss else author_lang
-                ins_el = ET.SubElement(
-                    p, f"{{{W_NS}}}ins",
-                    {f"{{{W_NS}}}author": author, f"{{{W_NS}}}date": now_iso, f"{{{W_NS}}}id": str(rev_id)}
+        if est_changes > max_changes or est_insert_chars > max_ins_chars:
+            # Streng runde
+            try:
+                improved_strict = improve_text(
+                    text=orig, tone=tone, model_name=model_name, glossary_note=glossary_note,
+                    strength=strength, max_changes=max_changes, max_insert_chars=max_ins_chars, strict=True
                 )
-                rev_id += 1
-                total_changes += 1
-                total_inserted_chars += len(seg)
-                if is_gloss:
-                    glossary_changes += 1
-                    glossary_inserted_chars += len(seg)
-                _add_text_run(ins_el, seg)
+                a2 = tokenize_keep_ws(orig)
+                b2 = tokenize_keep_ws(improved_strict)
+                ops2 = diff_tokens(a2, b2)
+                ch2 = sum(1 for op, _ in ops2 if op in {"+", "-"})
+                ins2 = sum(len(seg) for op, seg in ops2 if op == "+")
+                if (ch2 <= max_changes and ins2 <= max_ins_chars) or (ch2 + ins2 < est_changes + est_insert_chars):
+                    improved = improved_strict
+            except Exception:
+                pass  # behold improved
 
-            elif op == "-":
-                is_gloss = seg_norm in gl_delete_set
-                author = author_gloss if is_gloss else author_lang
-                del_el = ET.SubElement(
-                    p, f"{{{W_NS}}}del",
-                    {f"{{{W_NS}}}author": author, f"{{{W_NS}}}date": now_iso, f"{{{W_NS}}}id": str(rev_id)}
-                )
-                rev_id += 1
-                total_changes += 1
-                if is_gloss:
-                    glossary_changes += 1
-                _add_del_run(del_el, seg)
+        # Ordliste-pass (deterministisk)
+        if glossary:
+            final_text, gloss_report = apply_glossary_with_report(improved, glossary)
+        else:
+            final_text, gloss_report = improved, {"total": 0, "by_preferred": {}, "pairs": []}
 
-    new_body.append(sectPr_clone)
-    new_xml = ET.tostring(new_root, xml_declaration=True, encoding="UTF-8", standalone="yes")
+        # Skriv Track Changes inn i original-XML
+        rev_id, ch, ins_chars, gl_ch = rewrite_paragraph_with_track_changes(
+            p_el=p,
+            orig_text=orig,
+            improved_text=improved,
+            final_text=final_text,
+            authors=(author_lang, author_gloss),
+            W_NS=W_NS,
+            XML_NS=XML_NS,
+            now_iso=now_iso,
+            start_rev_id=rev_id
+        )
+        total_changes += ch
+        total_insert_chars += ins_chars
+        glossary_changes_total += gl_ch
+        # For innsettings-tegn pga ordliste: vi kan grovt anslå via gloss_report["pairs"], men for enkelhet teller vi samme
+        # sum som i track changes (innsettings-tegn er allerede i total_insert_chars). Her legger vi ikke duplikat.
 
-    out_bio = io.BytesIO()
-    with ZipFile(io.BytesIO(base_bytes), "r") as zin, ZipFile(out_bio, "w") as zout:
+        # Skriv "ren" tekst i clean_root (uten track changes)
+        clean_p = clean_root.findall(f".//{{{W_NS}}}p")[p_idx]
+        clear_paragraph_content_keep_pPr(clean_p, W_NS)
+        add_text_run(clean_p, W_NS, XML_NS, final_text)
+
+    # Bygg ny DOCX for tracked-varianten
+    out_tracked = io.BytesIO()
+    with ZipFile(out_tracked, "w") as zout:
         for item in zin.infolist():
             data = zin.read(item.filename)
             if item.filename == "word/document.xml":
-                data = new_xml
+                data = ET.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
             zout.writestr(item, data)
+    zin.close()
 
-    return out_bio.getvalue(), total_changes, total_inserted_chars, glossary_changes, glossary_inserted_chars
+    # Bygg ny DOCX for clean-varianten
+    out_clean = io.BytesIO()
+    with ZipFile(io.BytesIO(src_docx_bytes), "r") as zin2, ZipFile(out_clean, "w") as zout2:
+        for item in zin2.infolist():
+            data = zin2.read(item.filename)
+            if item.filename == "word/document.xml":
+                data = ET.tostring(clean_root, xml_declaration=True, encoding="UTF-8", standalone="yes")
+            zout2.writestr(item, data)
+
+    totals = {"changes": total_changes, "insert_chars": total_insert_chars}
+    gloss_totals = {"changes": glossary_changes_total, "insert_chars": 0}  # innsettings-tegn per ordliste deles ikke ut separat nå
+
+    return out_tracked.getvalue(), out_clean.getvalue(), totals, gloss_totals
 
 # =============================
 # Auto-last ordliste ved oppstart + husk sist brukte filnavn
 # =============================
 if "drive_glossary_filename" not in st.session_state:
-    # Prøv å hente sist brukt fra Drive-konfig
     conf = _load_app_config_from_drive()
     last_name = (conf or {}).get("glossary_filename")
     st.session_state["drive_glossary_filename"] = last_name or "ordliste02okt.csv"
 
-# Autolast ordliste én gang per økt
 if drive_enabled() and "glossary_autoload_done" not in st.session_state:
     try:
         g = load_glossary_from_drive(st.session_state["drive_glossary_filename"])
@@ -660,25 +782,23 @@ if drive_enabled() and "glossary_autoload_done" not in st.session_state:
         st.session_state["glossary_autoload_done"] = True
 
 # =============================
-# UI: tekstinn og modellvalg
+# UI: input
 # =============================
-tab1, tab2 = st.tabs(["📄 Word-fil (.docx)", "✍️ Lim inn tekst"])
-uploaded_text: str | None = None
+tab1, tab2 = st.tabs(["📄 Word-fil (.docx)", "✍️ Lim inn tekst (lages som ny fil)"])
+uploaded_docx_bytes: bytes | None = None
+pasted_text: str | None = None
 
 with tab1:
     up = st.file_uploader("Last opp .docx", type=["docx"])
     if up is not None:
         try:
-            src_bytes = up.read()
-            doc = Document(io.BytesIO(src_bytes))
-            uploaded_text = "\n".join(p.text for p in doc.paragraphs)
+            uploaded_docx_bytes = up.read()
         except Exception as e:
             st.error(f"Kunne ikke lese Word-filen: {e}")
 
 with tab2:
-    pasted = st.text_area("Lim inn tekst her", height=300, placeholder="Lim inn manus her …")
-    if pasted and not uploaded_text:
-        uploaded_text = pasted
+    pasted_text = st.text_area("Lim inn tekst her", height=300, placeholder="Lim inn manus her …")
+    st.caption("Hvis du limer inn tekst, bygger vi en ny Word-fil fra teksten og skriver endringer der.")
 
 # Tone + modell + aggressivitet
 tone_options = list(st.session_state["goals"].keys()) or list(DEFAULT_GOALS.keys())
@@ -686,11 +806,12 @@ colA, colB = st.columns(2)
 with colA:
     tone = st.selectbox("Tone/retning", tone_options, help="Velg hvordan teksten skal forbedres.")
 with colB:
+    # Standard gpt-5-mini (index=1)
     model_name = st.selectbox("Modell", ["gpt-5", "gpt-5-mini", "gpt-4o", "gpt-4o-mini"], index=1)
 
 strength = st.slider(
     "Aggressivitet (1=minimal, 5=aggressiv)", min_value=1, max_value=5, value=3,
-    help="Styrer hvor mange endringer som er ønsket. Appen beregner et budsjett og instruerer modellen."
+    help="Styrer hvor mange endringer som er ønsket. Budsjett brukes per avsnitt."
 )
 
 # =============================
@@ -717,7 +838,7 @@ with st.expander("✏️ Rediger PROMPTS (SYSTEM + GOALS for valgt tone)"):
             st.success("Prompter tilbakestilt til standardverdier.")
 
 # =============================
-# Ordliste-UI (kompakt – ingen innholdsvisning)
+# Ordliste-UI (kompakt)
 # =============================
 with st.expander("📚 Ordliste (last opp / Drive / lagre)"):
     drive_ok = drive_enabled()
@@ -791,85 +912,43 @@ author_gloss = st.text_input("Forfatter-tag for ordliste-pass", value="ChatGPT (
 stats_placeholder = st.empty()
 
 run_btn = st.button(
-    "⚙️ Forbedre språk og lag Ekte Track Changes",
+    "⚙️ Forbedre språk og lag Ekte Track Changes (i originalfilen)",
     type="primary",
-    disabled=(not uploaded_text or not OPENAI_API_KEY),
+    disabled=(not OPENAI_API_KEY or not (uploaded_docx_bytes or pasted_text)),
 )
 
 if run_btn:
-    if not uploaded_text:
-        st.error("Ingen tekst funnet.")
-        st.stop()
     if not OPENAI_API_KEY:
         st.error("OPENAI_API_KEY mangler.")
         st.stop()
 
     glossary = st.session_state.get("glossary", {})
 
-    glossary_note = None
-    if use_glossary_in_prompt and glossary:
-        preferred_list = "\n".join(f"- {p}" for p in list(glossary.keys())[:100])
-        glossary_note = (
-            "Bruk følgende prefererte termer konsekvent; normaliser eventuelle synonymer/varianter til eksakt skrivemåte:\n"
-            f"{preferred_list}"
-        )
+    # Kilde: enten lastet .docx eller tekst (da lager vi først en enkel .docx med teksten)
+    if pasted_text and not uploaded_docx_bytes:
+        # bygg en enkel docx fra limt tekst (ett avsnitt per linje)
+        d = Document()
+        for line in (pasted_text or "").split("\n"):
+            d.add_paragraph(line)
+        bio = io.BytesIO()
+        d.save(bio)
+        uploaded_docx_bytes = bio.getvalue()
 
-    # Budsjett fra aggressivitetsnivå
-    max_changes, max_ins_chars = budget_from_strength(len(uploaded_text or ""), strength)
-
-    # Pass 1: språk-forbedring (med budsjett)
-    with st.spinner("Forbedrer tekst (språk-pass) …"):
+    with st.spinner("Prosesserer dokument (per avsnitt) …"):
         try:
-            improved = improve_text(
-                text=uploaded_text, tone=tone, model_name=model_name, glossary_note=glossary_note,
-                strength=strength, max_changes=max_changes, max_insert_chars=max_ins_chars, strict=False
-            )
-        except Exception as e:
-            st.error(f"Feil fra modellen: {e}")
-            st.stop()
-
-    # Estimer mot budsjett
-    est_changes, est_ins_chars = estimate_changes(uploaded_text or "", improved or "")
-    exceeded = (est_changes > max_changes) or (est_ins_chars > max_ins_chars)
-
-    # Streng re-run hvis budsjett overskredet
-    if exceeded:
-        with st.spinner("Strammer inn til budsjettet …"):
-            try:
-                improved_strict = improve_text(
-                    text=uploaded_text, tone=tone, model_name=model_name, glossary_note=glossary_note,
-                    strength=strength, max_changes=max_changes, max_insert_chars=max_ins_chars, strict=True
-                )
-                ch1, ins1 = est_changes, est_ins_chars
-                ch2, ins2 = estimate_changes(uploaded_text or "", improved_strict or "")
-                if (ch2 <= max_changes and ins2 <= max_ins_chars) or (ch2 + ins2 < ch1 + ins1):
-                    improved = improved_strict
-                    est_changes, est_ins_chars = ch2, ins2
-                    exceeded = (est_changes > max_changes) or (est_ins_chars > max_ins_chars)
-            except Exception as e:
-                st.warning(f"Klarte ikke å stramme inn automatisk: {e}")
-
-    # Pass 2: deterministisk ordliste-normalisering + rapport
-    if glossary:
-        final_text, gloss_report = apply_glossary_with_report(improved, glossary)
-    else:
-        final_text, gloss_report = improved, {"total": 0, "by_preferred": {}, "pairs": []}
-
-    improved_docx = make_docx_from_text(final_text, "Forbedret tekst")
-
-    # Generer Track Changes (to forfattere)
-    with st.spinner("Genererer ekte Track Changes …"):
-        try:
-            tracked_docx, changes_count, inserted_chars, gl_changes, gl_inserted_chars = make_tracked_changes_docx(
-                original_text=uploaded_text or "",
-                improved_text=improved or "",
-                final_text=final_text or "",
+            tracked_bytes, clean_bytes, totals, gloss_totals = process_docx_with_track_changes(
+                src_docx_bytes=uploaded_docx_bytes,
+                tone=tone,
+                model_name=model_name,
+                glossary=glossary,
+                include_gloss_in_prompt=use_glossary_in_prompt,
+                strength=strength,
                 author_lang=author_lang or "ChatGPT",
                 author_gloss=author_gloss or "ChatGPT (ordliste)",
             )
         except Exception as e:
-            st.error(f"Klarte ikke å lage Track Changes-dokument: {e}")
-            tracked_docx, changes_count, inserted_chars, gl_changes, gl_inserted_chars = None, 0, 0, 0, 0
+            st.error(f"Klarte ikke å generere Track Changes i originalfilen: {e}")
+            st.stop()
 
     st.success("Ferdig!")
 
@@ -878,41 +957,32 @@ if run_btn:
         st.subheader("📊 Resultatstatistikk")
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.metric("Foreslåtte endringer (totalt)", f"{changes_count:,}")
+            st.metric("Foreslåtte endringer (totalt)", f"{totals.get('changes', 0):,}")
         with c2:
-            st.metric("Tegn i innsatte forslag (totalt)", f"{inserted_chars:,}")
+            st.metric("Tegn i innsatte forslag (totalt)", f"{totals.get('insert_chars', 0):,}")
         with c3:
-            st.metric("Ordlistendringer (antall)", f"{gl_changes:,}")
+            st.metric("Ordlistendringer (antall)", f"{gloss_totals.get('changes', 0):,}")
+        st.caption("Budsjett er anvendt per avsnitt. Word farger endringer “By author” (Review → Change Tracking Options).")
 
-        st.markdown(
-            f"- **Budsjett (nivå {strength})**: ≤ **{max_changes}** endringer, ≤ **{max_ins_chars}** innsettingstegn\n"
-            f"- **Språk-pass estimerte endringer**: {est_changes:,} / {est_ins_chars:,} tegn "
-            + ("✅ innen budsjett" if not exceeded else "⚠️ over budsjett")
-        )
-        st.caption("Budsjettet styrer modellen via instruksjoner og en automatisk innstrammingsrunde ved behov.")
+    st.download_button(
+        "📝 Last ned med ekte Spor endringer (.docx)",
+        data=tracked_bytes,
+        file_name="forbedret_spor_endringer_ekte.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
 
-    # Nedlasting (ingen forhåndsvisningstekst i UI)
     st.download_button(
         "💾 Last ned ren forbedret Word (.docx)",
-        data=improved_docx,
+        data=clean_bytes,
         file_name="forbedret_ren.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
 
-    if tracked_docx:
-        st.download_button(
-            "📝 Last ned med ekte Spor endringer (.docx)",
-            data=tracked_docx,
-            file_name="forbedret_spor_endringer_ekte.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
-
 st.markdown("---")
 st.markdown(
     textwrap.dedent("""
-    **Aggressivitet:** Slideren styrer et endringsbudsjett og klare regler i prompten. Appen måler resultatet
-    og prøver en strengere ny runde hvis budsjettet sprenges.  
+    **Valg B aktiv:** Endringer skrives inn i originalens avsnitt (også i tabeller).  
+    **Begrensning:** Inline-stil (fet/kursiv) på *endrede* tekstbiter kan gå tapt. Dokumentets stiler/nummerering bevares.  
     **Farger i Word:** To forfattere (språk/ordliste) → to farger når Word står på “By author”.
     """)
 )
-
