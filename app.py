@@ -152,6 +152,7 @@ def _drive_service():
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return build("drive", "v3", credentials=creds)
 
+
 def drive_find_file(service, folder_id: str, name: str) -> dict | None:
     def _norm(s: str) -> str:
         return re.sub(r"\s+", " ", s).strip().lower()
