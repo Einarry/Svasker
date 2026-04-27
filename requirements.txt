@@ -1,5 +1,6 @@
 streamlit
-python-docx
-openai
+beautifulsoup4
+weasyprint
+pillow
 google-api-python-client
 google-auth
